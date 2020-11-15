@@ -1,0 +1,46 @@
+sections: 
+  - tracks:
+    - channel: 10
+      swing: 1
+      steps:
+        - note: 1
+          velocity: 127
+        - note: 2
+          velocity: 127
+        - note: 3
+          velocity: 127
+        - note: 4
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 4
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 4
+          velocity: 127
+        - note: 8
+          velocity: 127
+        - note: 1
+          velocity: 127
+    - channel: 10
+      swing: 0
+      steps:
+        - note: 14
+          velocity: 127
+        - note: 14
+          velocity: 127
+        - note: 14
+          velocity: 127

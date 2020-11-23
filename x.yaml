@@ -1,46 +1,162 @@
-sections: 
-  - tracks:
-    - channel: 10
-      swing: 1
-      steps:
-        - note: 1
-          velocity: 127
-        - note: 2
-          velocity: 127
-        - note: 3
-          velocity: 127
-        - note: 4
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 4
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 4
-          velocity: 127
-        - note: 8
-          velocity: 127
-        - note: 1
-          velocity: 127
-    - channel: 10
-      swing: 0
-      steps:
-        - note: 14
-          velocity: 127
-        - note: 14
-          velocity: 127
-        - note: 14
-          velocity: 127
+sections:
+- notes:
+  - channel: 0
+    duration: 0.3
+    note: 40
+    time: 0.0
+    velocity: 127
+  - channel: 0
+    duration: 0.3
+    note: 44
+    time: 0.0
+    velocity: 127
+  - channel: 0
+    duration: 0.3
+    note: 47
+    time: 0.0
+    velocity: 127
+  - channel: 0
+    duration: 0.3
+    note: 52
+    time: 0.3333333333333333
+    velocity: 127
+  - channel: 0
+    duration: 0.3
+    note: 54
+    time: 0.3333333333333333
+    velocity: 127
+  - channel: 0
+    duration: 0.3
+    note: 42
+    time: 0.6666666666666666
+    velocity: 127
+  - channel: 0
+    duration: 0.3
+    note: 46
+    time: 0.6666666666666666
+    velocity: 127
+  - channel: 0
+    duration: 0.3
+    note: 49
+    time: 0.6666666666666666
+    velocity: 127
+  - channel: 0
+    duration: 0.18
+    note: 52
+    time: 0.0
+    velocity: 127
+  - channel: 0
+    duration: 0.18
+    note: 56
+    time: 0.2
+    velocity: 127
+  - channel: 0
+    duration: 0.18
+    note: 61
+    time: 0.6
+    velocity: 127
+  - channel: 0
+    duration: 0.18
+    note: 59
+    time: 0.8
+    velocity: 127
+  - channel: 10
+    duration: 0.225
+    note: 8
+    time: 0.0
+    velocity: 127
+  - channel: 10
+    duration: 0.225
+    note: 8
+    time: 0.5
+    velocity: 127
+  - channel: 10
+    duration: 0.225
+    note: 21
+    time: 0.25
+    velocity: 127
+  - channel: 10
+    duration: 0.225
+    note: 21
+    time: 0.75
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.0
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.0625
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.125
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.1875
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.25
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.3125
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.375
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.4375
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.5
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.5625
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.625
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.6875
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.75
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.8125
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.875
+    velocity: 127
+  - channel: 10
+    duration: 0.05625
+    note: 10
+    time: 0.9375
+    velocity: 127

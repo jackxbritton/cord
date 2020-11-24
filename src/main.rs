@@ -1,8 +1,8 @@
 use crossbeam::{bounded, Receiver, Sender};
-use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::default::Default;
 use std::error::Error;
+use std::f64::consts::PI;
 use std::io::Read;
 use std::iter::once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -99,10 +99,10 @@ impl Song {
             });
             let mut midi_state = [[false; 128]; 16];
             for MidiNote {
-                time,
                 channel,
                 note,
                 velocity_and_duration,
+                ..
             } in notes
             {
                 let on = velocity_and_duration.is_some();
@@ -147,9 +147,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             if !RUNNING.load(Ordering::Relaxed) {
                 let channels_and_notes =
                     (0..16).flat_map(|channel| (0..128).map(move |note| (channel, note)));
-                let notes_to_turn_off =
-                    channels_and_notes.filter(|&(channel, note)| midi_state[channel][note] > 0);
-                for (channel, note) in notes_to_turn_off {
+                for (channel, note) in channels_and_notes {
+                    if midi_state[channel][note] == 0 {
+                        continue;
+                    }
                     let bytes = [0x80 | channel as u8, note as u8, 0];
                     match writer.write(&jack::RawMidi {
                         bytes: &bytes,
@@ -161,8 +162,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                         _ => (),
                     };
+                    midi_state[channel][note] = 0;
                 }
-                midi_state = [[0; 128]; 16];
                 return jack::Control::Quit;
             }
 
@@ -184,8 +185,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             let rate = 0.5;
-            let dt = rate * buffer_period;
+            let n = 4.0;
+            let max_swing = 1.0 - (n - 0.5) / n; // Btw.
+            let swing = 0.02_f64.min(0.9 * max_swing);
+            let dt = (rate * buffer_period) * (1.0 + swing * n * (2.0 * PI * n * clock).sin());
             let new_clock = (clock + dt) % 1.0;
+
+            // TODO(jack) Swing.
+            // TODO(jack) Sections.
 
             // According to the new clock, compute the desired MIDI state.
             let new_midi_state = {
@@ -210,15 +217,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Next, resolve the differences with the present MIDI state.
             let channels_and_notes =
                 (0..16).flat_map(|channel| (0..128).map(move |note| (channel, note)));
-            let events_to_resolve = channels_and_notes.filter_map(|(channel, note)| {
+            for (channel, note) in channels_and_notes {
                 let (velocity, time) = new_midi_state[channel][note];
-                if midi_state[channel][note] != velocity {
-                    Some((time, channel, note, velocity))
-                } else {
-                    None
+                if midi_state[channel][note] == velocity {
+                    continue;
                 }
-            });
-            for (time, channel, note, velocity) in events_to_resolve {
                 let bytes = [
                     if velocity > 0 { 0x90 } else { 0x80 } | channel as u8,
                     note as u8,

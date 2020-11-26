@@ -1,321 +1,53 @@
-rate: 0.45
+rate: 0.3
 sections:
-- notes:
-  - channel: 9
-    duration: 0.125
+- events:
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.45
     note: 17
     time: 0.0
     velocity: 127
-  - channel: 9
-    duration: 0.125
-    note: 17
-    time: 0.25
-    velocity: 127
-  - channel: 9
-    duration: 0.125
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.45
     note: 17
     time: 0.5
     velocity: 127
-  - channel: 9
-    duration: 0.125
-    note: 17
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.45
+    note: 30
+    time: 0.25
+    velocity: 127
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.45
+    note: 30
     time: 0.75
     velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.0
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.0625
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.225
     note: 10
     time: 0.125
     velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.1875
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.25
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.3125
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.225
     note: 10
     time: 0.375
     velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.4375
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.5
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.5625
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.225
     note: 10
     time: 0.625
     velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.6875
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.75
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 10
-    time: 0.8125
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
+  - chance_to_fire: 1
+    channel: 9
+    duration: 0.225
     note: 10
     time: 0.875
     velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 24
-    time: 0.0625
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 24
-    time: 0.1875
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 24
-    time: 0.3125
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 24
-    time: 0.4375
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 24
-    time: 0.5625
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 24
-    time: 0.6875
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 24
-    time: 0.8125
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 24
-    time: 0.9375
-    velocity: 127
-  - channel: 9
-    duration: 0.125
-    note: 30
-    time: 0.625
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 30
-    time: 0.875
-    velocity: 127
-- notes:
-  - channel: 9
-    duration: 0.125
-    note: 17
-    time: 0.0
-    velocity: 127
-  - channel: 9
-    duration: 0.125
-    note: 17
-    time: 0.25
-    velocity: 127
-  - channel: 9
-    duration: 0.125
-    note: 17
-    time: 0.5
-    velocity: 127
-  - channel: 9
-    duration: 0.125
-    note: 17
-    time: 0.75
-    velocity: 127
-  - channel: 9
-    duration: 0.015625
-    note: 10
-    time: 0.25
-    velocity: 127
-  - channel: 9
-    duration: 0.015625
-    note: 10
-    time: 0.28125
-    velocity: 127
-  - channel: 9
-    duration: 0.015625
-    note: 10
-    time: 0.3125
-    velocity: 127
-  - channel: 9
-    duration: 0.015625
-    note: 10
-    time: 0.34375
-    velocity: 127
-  - channel: 9
-    duration: 0.015625
-    note: 10
-    time: 0.375
-    velocity: 127
-  - channel: 9
-    duration: 0.015625
-    note: 10
-    time: 0.40625
-    velocity: 127
-  - channel: 9
-    duration: 0.28125
-    note: 10
-    time: 0.4375
-    velocity: 127
-  - channel: 9
-    duration: 0.03125
-    note: 24
-    time: 0.9375
-    velocity: 127
-  - channel: 9
-    duration: 0.125
-    note: 30
-    time: 0.625
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 30
-    time: 0.875
-    velocity: 127
-- notes:
-  - channel: 9
-    duration: 0.020833333333333343
-    note: 17
-    time: 0.25
-    velocity: 127
-  - channel: 9
-    duration: 0.0625
-    note: 17
-    time: 0.2916666666666667
-    velocity: 127
-  - channel: 9
-    duration: 0.020833333333333315
-    note: 17
-    time: 0.4166666666666667
-    velocity: 127
-  - channel: 9
-    duration: 0.27083333333333337
-    note: 17
-    time: 0.4583333333333333
-    velocity: 127
-  - channel: 9
-    duration: 0.020833333333333332
-    note: 30
-    time: 0.0
-    velocity: 127
-  - channel: 9
-    duration: 0.020833333333333332
-    note: 30
-    time: 0.041666666666666664
-    velocity: 127
-  - channel: 9
-    duration: 0.3958333333333333
-    note: 30
-    time: 0.08333333333333333
-    velocity: 127
-  - channel: 9
-    duration: 0.020833333333333315
-    note: 30
-    time: 0.875
-    velocity: 127
-  - channel: 9
-    duration: 0.02083333333333337
-    note: 30
-    time: 0.9166666666666666
-    velocity: 127
-  - channel: 9
-    duration: 0.020833333333333315
-    note: 30
-    time: 0.9583333333333334
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 40
-    time: 0.0
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 40
-    time: 0.125
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 47
-    time: 0.25
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 47
-    time: 0.375
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 43
-    time: 0.5
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 43
-    time: 0.625
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 45
-    time: 0.75
-    velocity: 127
-  - channel: 0
-    duration: 0.1125
-    note: 45
-    time: 0.875
-    velocity: 127
-  - channel: 0
-    duration: 0.45
-    note: 54
-    time: 0.0
-    velocity: 127
-  - channel: 0
-    duration: 0.45
-    note: 59
-    time: 0.5
-    velocity: 127
-swing: 0.1
+swing: 0.2
+swing_cycles_per_section: 4

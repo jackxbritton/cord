@@ -48,9 +48,8 @@ struct Section {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 struct Song {
-    rate: f64,
+    bpm: u8,
     swing: f64,
-    swing_cycles_per_section: u8,
     sections: Vec<Section>,
 }
 
@@ -66,9 +65,6 @@ impl Song {
             }
             song
         };
-        if !(0.0..).contains(&song.rate) {
-            Err("rate is not in the range 0.0..")?;
-        }
         if !(0.0..=1.0).contains(&song.swing) {
             Err("swing is not in the range 0.0..=1.0")?;
         }
@@ -151,7 +147,6 @@ struct Playback {
     song: Song,
     current_section: usize,
     clock: f64,
-    clock_with_swing: f64,
     midi_event_queue: VecDeque<MidiEvent>,
     midi_note_state: [[bool; 128]; 16],
 }
@@ -205,10 +200,17 @@ impl Playback {
             };
         }
     }
-    fn advance_clock(&mut self, dt: f64) {
-        for MidiEvent { time, .. } in &mut self.midi_event_queue {
-            *time = *time - dt;
-        }
+    fn apply_swing_to_clock(&self, clock: f64) -> f64 {
+        // Compute the clock with swing.
+        // Swing is a sinusoid that oscillates note displacement.
+        let (beats_per_measure, _beats_per_note) = (4, 4); // Time signature.
+        let cycles_per_section = beats_per_measure as f64 * 2.0;
+        // If the swing is greater than max_swing, time will move backwards.
+        // You can prove this by setting the derivative of our sinusoid to -1.
+        let sinusoid = (2.0 * PI * cycles_per_section * clock).cos();
+        let max_swing = 1.0 / (PI * cycles_per_section);
+        let displacement = self.song.swing * max_swing * (0.5 - 0.5 * sinusoid);
+        clock + displacement
     }
     fn write_midi_event(
         &mut self,
@@ -261,6 +263,47 @@ impl Playback {
             }
         }
     }
+    fn step(
+        &mut self,
+        writer: &mut jack::MidiWriter,
+        buffer_period: f64,
+    ) -> Result<(), jack::Error> {
+        // Advance the clock and schedule events.
+        let (beats_per_measure, _beats_per_note) = (4, 4); // Time signature.
+        let seconds_per_measure = beats_per_measure as f64 * 60.0 / self.song.bpm as f64;
+        let dt = buffer_period / seconds_per_measure;
+        let new_clock = self.clock + dt;
+        if new_clock < 1.0 {
+            self.schedule_midi_events(
+                self.apply_swing_to_clock(self.clock)..self.apply_swing_to_clock(new_clock),
+            );
+            self.clock = new_clock;
+        } else {
+            let new_clock = new_clock % 1.0;
+            self.schedule_midi_events(self.apply_swing_to_clock(self.clock)..1.0);
+            if self.song.sections.len() > 0 {
+                self.current_section = (self.current_section + 1) % self.song.sections.len();
+            }
+            self.schedule_midi_events(0.0..self.apply_swing_to_clock(new_clock));
+            self.clock = new_clock;
+        }
+        self.midi_event_queue.make_contiguous().sort();
+        // Advance event timers.
+        for MidiEvent { time, .. } in &mut self.midi_event_queue {
+            *time = *time - dt;
+        }
+        // Send events.
+        while let Some(midi_event) = self.midi_event_queue.pop_front() {
+            if midi_event.time > 0.0 {
+                self.midi_event_queue.push_front(midi_event);
+                break;
+            }
+            // TODO(jack) Check this math.
+            let time = ((1.0 + midi_event.time / dt) / buffer_period) as u32;
+            self.write_midi_event(writer, midi_event, time)?
+        }
+        Ok(())
+    }
 }
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -279,13 +322,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         song: Song::default(),
         current_section: 0,
         clock: 0.0,
-        clock_with_swing: 0.0,
         midi_event_queue: VecDeque::with_capacity(32),
         midi_note_state: [[false; 128]; 16],
     };
     let _active_client = client.activate_async(
         (),
-        jack::ClosureProcessHandler::new(move |client, ps| {
+        jack::ClosureProcessHandler::new(move |_client, ps| {
             if let Some(new_song) = song_rx.try_iter().last() {
                 playback.song = new_song;
             };
@@ -309,65 +351,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            // Advance the clock.
-            playback.clock = playback.clock + playback.song.rate * buffer_period;
-            let overflow = playback.clock >= 1.0;
-            if overflow {
-                // If the clock rolled over, schedule remaining events and advance the section.
-                playback.schedule_midi_events(playback.clock_with_swing..1.0);
-                playback.current_section =
-                    (playback.current_section + 1) % playback.song.sections.len().max(1);
-                playback.clock %= 1.0;
-            }
-
-            // Compute the clock with swing.
-            // Swing is a sinusoid that oscillates note displacement.
-            let old_clock_with_swing = playback.clock_with_swing;
-            let cycles_per_section = playback.song.swing_cycles_per_section as f64;
-            // If the swing is greater than max_swing, time will move backwards.
-            // You can prove this by setting the derivative of our sinusoid to -1.
-            let max_swing = 1.0 / (PI * cycles_per_section);
-            playback.clock_with_swing = playback.clock
-                + playback.song.swing
-                    * max_swing
-                    * (0.5 - 0.5 * (2.0 * PI * cycles_per_section * playback.clock).cos());
-            let clock_range = if overflow {
-                0.0..playback.clock_with_swing
-            } else {
-                // To avoid errors where quick changes in swing cause time to move backwards,
-                // clamp the swing against the last swing.
-                playback.clock_with_swing = playback.clock_with_swing.max(old_clock_with_swing);
-                old_clock_with_swing..playback.clock_with_swing
-            };
-
-            playback.schedule_midi_events(clock_range);
-
-            let dt = (playback.clock_with_swing + 1.0 - old_clock_with_swing) % 1.0;
-            playback.advance_timers(dt);
-
-            // Sort the event queue.
-            playback.midi_event_queue.make_contiguous().sort();
-
-            // Emit note events.
-            while let Some(midi_event) = playback.midi_event_queue.pop_front() {
-                if midi_event.time > 0.0 {
-                    playback.midi_event_queue.push_front(midi_event);
-                    break;
+            match playback.step(&mut writer, buffer_period) {
+                Ok(()) | Err(jack::Error::NotEnoughSpace) => jack::Control::Continue,
+                Err(err) => {
+                    eprintln!("{}", err);
+                    RUNNING.store(false, Relaxed);
+                    return jack::Control::Quit;
                 }
-                // println!("{:?}", midi_event.fields);
-                let time = ((1.0 + midi_event.time / dt) * client.buffer_size() as f64) as u32;
-                match playback.write_midi_event(&mut writer, midi_event, time) {
-                    Err(jack::Error::NotEnoughSpace) => return jack::Control::Continue,
-                    Err(err) => {
-                        eprintln!("{}", err);
-                        RUNNING.store(false, Relaxed);
-                        return jack::Control::Quit;
-                    }
-                    Ok(()) => (),
-                };
             }
-
-            jack::Control::Continue
         }),
     )?;
 

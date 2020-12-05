@@ -1,53 +1,352 @@
-rate: 0.3
+bpm: 120
 sections:
 - events:
-  - chance_to_fire: 1
+  - chance_to_fire: 0.3
     channel: 9
-    duration: 0.45
-    note: 17
+    duration: 0.225
+    note: 0
     time: 0.0
     velocity: 127
-  - chance_to_fire: 1
+  - chance_to_fire: 0.3
     channel: 9
-    duration: 0.45
-    note: 17
-    time: 0.5
-    velocity: 127
-  - chance_to_fire: 1
-    channel: 9
-    duration: 0.45
-    note: 30
+    duration: 0.225
+    note: 0
     time: 0.25
     velocity: 127
-  - chance_to_fire: 1
+  - chance_to_fire: 0.3
     channel: 9
-    duration: 0.45
-    note: 30
+    duration: 0.225
+    note: 0
+    time: 0.5
+    velocity: 127
+  - chance_to_fire: 0.3
+    channel: 9
+    duration: 0.225
+    note: 0
     time: 0.75
     velocity: 127
-  - chance_to_fire: 1
+  - chance_to_fire: 0.1
     channel: 9
-    duration: 0.225
-    note: 10
+    duration: 0.05625
+    note: 1
+    time: 0.0
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.0625
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
     time: 0.125
     velocity: 127
-  - chance_to_fire: 1
+  - chance_to_fire: 0.1
     channel: 9
-    duration: 0.225
-    note: 10
+    duration: 0.05625
+    note: 1
+    time: 0.1875
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.25
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.3125
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
     time: 0.375
     velocity: 127
-  - chance_to_fire: 1
+  - chance_to_fire: 0.1
     channel: 9
-    duration: 0.225
-    note: 10
+    duration: 0.05625
+    note: 1
+    time: 0.4375
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.5
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.5625
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
     time: 0.625
     velocity: 127
-  - chance_to_fire: 1
+  - chance_to_fire: 0.1
     channel: 9
-    duration: 0.225
-    note: 10
+    duration: 0.05625
+    note: 1
+    time: 0.6875
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.75
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.8125
+    velocity: 127
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
     time: 0.875
     velocity: 127
-swing: 0.2
-swing_cycles_per_section: 4
+  - chance_to_fire: 0.1
+    channel: 9
+    duration: 0.05625
+    note: 1
+    time: 0.9375
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.0
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.0625
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.125
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.1875
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.25
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.3125
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.375
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.4375
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.5
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.5625
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.625
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.6875
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.75
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.8125
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.875
+    velocity: 127
+  - chance_to_fire: 0.2
+    channel: 9
+    duration: 0.05625
+    note: 2
+    time: 0.9375
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.0
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.0625
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.125
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.1875
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.25
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.3125
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.375
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.4375
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.5
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.5625
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.625
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.6875
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.75
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.8125
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.875
+    velocity: 127
+  - chance_to_fire: 0.6
+    channel: 9
+    duration: 0.05625
+    note: 3
+    time: 0.9375
+    velocity: 127
+  - channel: 9
+    controller: 0
+    time: 0
+    value: 105
+  - channel: 9
+    controller: 1
+    time: 0
+    value: 75
+  - channel: 9
+    controller: 2
+    time: 0
+    value: 2
+  - channel: 9
+    controller: 3
+    time: 0
+    value: 33
+  - channel: 9
+    controller: 4
+    time: 0
+    value: 9
+  - channel: 9
+    controller: 16
+    time: 0
+    value: 5
+  - channel: 9
+    controller: 17
+    time: 0
+    value: 13
+  - channel: 9
+    controller: 18
+    time: 0
+    value: 72
+  - channel: 9
+    controller: 19
+    time: 0
+    value: 68
+swing: 0.4

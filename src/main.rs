@@ -1,7 +1,7 @@
 mod midi;
 
 use crossbeam::select;
-use crossbeam::{Receiver, Sender};
+use crossbeam::{Receiver, SendError, Sender};
 use midi::*;
 use std::error::Error;
 use std::io::{stdin, stdout, Write};
@@ -14,29 +14,35 @@ use termion::raw::IntoRawMode;
 use termion::screen::AlternateScreen;
 use termion::{clear, color, cursor, style};
 
-// TODO(jack) Lots to do, but let's start by rendering to a song.
-
 enum UIState {
-    EditNote { track: usize, acc: u32 },
-    EditSteps { track: usize },
+    EditNote { acc: u32 },
+    EditSteps,
+    EditBpm { acc: u32 },
+    EditSwing { acc: u32 },
     Err(Box<dyn Error>),
 }
 
-struct UI {
+type Track = (u8, Vec<bool>);
+
+struct UI<'a> {
+    paused: bool,
     bpm: u32,
-    tracks: Vec<(u8, Vec<bool>)>,
+    swing: u32,
+    tracks: Vec<Track>,
     clock: f64,
     state: UIState,
+    focused_track: usize,
+    focused_step: usize,
+    backend: Option<&'a dyn Backend>,
 }
 
-impl UI {
+impl<'a> UI<'a> {
     fn step(
         &mut self,
         event_rx: &Receiver<Event>,
         error_rx: &Receiver<Box<dyn Error + Send>>,
-        backend: &dyn Backend,
     ) -> bool {
-        match self.step_helper(event_rx, error_rx, backend) {
+        match self.step_helper(event_rx, error_rx) {
             Ok(quit) => quit,
             Err(err) => {
                 self.state = UIState::Err(err);
@@ -48,81 +54,177 @@ impl UI {
         &mut self,
         event_rx: &Receiver<Event>,
         error_rx: &Receiver<Box<dyn Error + Send>>,
-        backend: &dyn Backend,
     ) -> Result<bool, Box<dyn Error>> {
+        let never = crossbeam::channel::never();
+        let clock_rx = self
+            .backend
+            .map(|backend| backend.clock_rx())
+            .unwrap_or(&never);
+        let never = crossbeam::channel::never();
+        let fatal_rx = self
+            .backend
+            .map(|backend| backend.fatal_rx())
+            .unwrap_or(&never);
         select! {
             recv(event_rx) -> event => {
                 if !self.handle_input(event?) {
-                    backend.quit_tx().send(()).ok();
+                    if let Some(backend) = self.backend {
+                        backend.quit_tx().send(()).ok();
+                    }
                     return Ok(false);
                 }
 
-                // TODO(jack) Render to song and send to the backend.
-                let events = self .tracks.iter().flat_map(move |(note, steps)| steps.iter() .enumerate() .filter(|(_index, step)| **step).map(move |(index, _step)| midi::Event{time: index as f64 / steps.len() as f64, channel: 9, fields: EventFields::Note{note: *note, velocity: 127, duration: 0.5 / steps.len() as f64, chance_to_fire: 1.0}})).collect();
-                backend.song_tx().send(Song{
-                    bpm: self.bpm,
-                    swing: 0.0,
-                    sections: vec![Section{next_section: None, events}],
-                })?;
+                self.render_to_backend()?;
+
             },
             recv(error_rx) -> err => return Err(err?),
-            recv(backend.clock_rx()) -> clock => self.clock = clock?,
+            recv(clock_rx) -> clock => self.clock = clock?,
+            recv(fatal_rx) -> err => {
+                self.backend = None;
+                return Err(err?);
+            },
         };
         Ok(true)
     }
     fn handle_input(&mut self, event: Event) -> bool {
-        match (&mut self.state, event) {
-            (_, Event::Key(Key::Ctrl('c'))) => return false,
-            (UIState::EditSteps { .. }, Event::Key(Key::Char('='))) => {
+        let step_chars = [
+            '1', '!', '2', '@', '3', '#', '4', '$', '5', '%', '6', '^', '7', '&', '8', '*',
+        ];
+        match (&mut self.state, self.tracks.len(), event) {
+            (_, _, Event::Key(Key::Ctrl('c'))) => return false,
+            (_, _, Event::Key(Key::Char(' '))) => self.paused = !self.paused,
+            (UIState::EditSteps { .. }, _, Event::Key(Key::Char('='))) => {
                 self.bpm = (self.bpm + 1).min(300)
             }
-            (UIState::EditSteps { .. }, Event::Key(Key::Char('-'))) => {
+            (UIState::EditSteps { .. }, _, Event::Key(Key::Char('-'))) => {
                 self.bpm = self.bpm.checked_sub(1).unwrap_or(0)
             }
-            (UIState::EditSteps { .. }, Event::Key(Key::Insert)) => {
-                self.tracks.push((0, (0..8).map(|_| false).collect()));
+            (&mut UIState::EditSteps, len, Event::Key(Key::Insert)) => {
+                let track = (0, (0..16).map(|_| false).collect());
+                match len {
+                    len if len == 0 || self.focused_track == len - 1 => {
+                        self.focused_track = len;
+                        self.tracks.push(track);
+                    }
+                    _ => {
+                        self.focused_track += 1;
+                        self.tracks.insert(self.focused_track, track);
+                    }
+                };
             }
-            (UIState::EditSteps { track }, Event::Key(Key::Delete)) => {
-                self.tracks.remove(*track);
-                *track = (*track).min(self.tracks.len() - 1);
+            (&mut UIState::EditSteps, 0, _) => (), // If zero tracks, there's not much we can do here.
+            (UIState::EditSteps, _, Event::Key(Key::Delete)) => {
+                self.tracks.remove(self.focused_track);
+                self.focused_track = if self.tracks.len() == 0 {
+                    0
+                } else {
+                    self.focused_track.min(self.tracks.len() - 1)
+                };
             }
-            (&mut UIState::EditSteps { track }, Event::Key(Key::Char('j'))) => {
-                if self.tracks.len() > 0 {
-                    self.state = UIState::EditSteps {
-                        track: (track + 1) % self.tracks.len(),
-                    };
+            (&mut UIState::EditSteps, _, Event::Key(Key::Char('j'))) => {
+                self.focused_track = (self.focused_track + 1) % self.tracks.len();
+            }
+            (&mut UIState::EditSteps, _, Event::Key(Key::Char('k'))) => {
+                self.focused_track =
+                    (self.focused_track + self.tracks.len() - 1) % self.tracks.len();
+            }
+            (&mut UIState::EditSteps, _, Event::Key(Key::Char(ch))) if step_chars.contains(&ch) => {
+                let step = step_chars.iter().position(|&other| other == ch).unwrap();
+                if let Some(on) = self.tracks[self.focused_track].1.get_mut(step) {
+                    self.focused_step = step;
+                    *on = !*on;
                 }
             }
-            (&mut UIState::EditSteps { track }, Event::Key(Key::Char('k'))) => {
-                if self.tracks.len() > 0 {
-                    self.state = UIState::EditSteps {
-                        track: (track + self.tracks.len() - 1) % self.tracks.len(),
-                    };
-                }
+
+            // Edit note.
+            (&mut UIState::EditSteps, _, Event::Key(Key::Char('n'))) => {
+                self.state = UIState::EditNote { acc: 0 };
             }
-            (&mut UIState::EditSteps { track }, Event::Key(Key::Char(ch @ '0'..='9'))) => {
-                let step = ch.to_digit(10).unwrap() as usize;
-                if let Some(step) = self.tracks[track].1.get_mut(step) {
-                    *step = !*step;
-                }
-            }
-            (&mut UIState::EditSteps { track }, Event::Key(Key::Char('n'))) => {
-                self.state = UIState::EditNote { track, acc: 0 }
-            }
-            (UIState::EditNote { acc, .. }, Event::Key(Key::Char(ch @ '0'..='9'))) => {
+            (UIState::EditNote { acc }, _, Event::Key(Key::Char(ch @ '0'..='9'))) => {
                 let new_acc = 10 * *acc + ch.to_digit(10).unwrap();
                 if new_acc <= 999 {
                     *acc = new_acc;
                 }
             }
-            (UIState::EditNote { acc, .. }, Event::Key(Key::Backspace)) => *acc /= 10,
-            (&mut UIState::EditNote { track, acc }, Event::Key(Key::Char('\n'))) => {
-                self.tracks[track].0 = acc.min(127) as u8;
-                self.state = UIState::EditSteps { track };
+            (UIState::EditNote { acc, .. }, _, Event::Key(Key::Backspace)) => *acc /= 10,
+            (&mut UIState::EditNote { acc }, _, Event::Key(Key::Char('\n'))) => {
+                self.tracks[self.focused_track].0 = acc.min(127) as u8;
+                self.state = UIState::EditSteps;
             }
+
+            // Edit bpm.
+            (&mut UIState::EditSteps { .. }, _, Event::Key(Key::Char('b'))) => {
+                self.state = UIState::EditBpm { acc: 0 }
+            }
+            (UIState::EditBpm { acc }, _, Event::Key(Key::Char(ch @ '0'..='9'))) => {
+                let new_acc = 10 * *acc + ch.to_digit(10).unwrap();
+                if new_acc <= 999 {
+                    *acc = new_acc;
+                }
+            }
+            (UIState::EditBpm { acc }, _, Event::Key(Key::Backspace)) => *acc /= 10,
+            (&mut UIState::EditBpm { acc }, _, Event::Key(Key::Char('\n'))) => {
+                self.bpm = acc.min(300);
+                self.state = UIState::EditSteps;
+            }
+
+            // Edit swing.
+            (&mut UIState::EditSteps { .. }, _, Event::Key(Key::Char('s'))) => {
+                self.state = UIState::EditSwing { acc: 0 }
+            }
+            (UIState::EditSwing { acc }, _, Event::Key(Key::Char(ch @ '0'..='9'))) => {
+                let new_acc = 10 * *acc + ch.to_digit(10).unwrap();
+                if new_acc <= 9 {
+                    *acc = new_acc;
+                }
+            }
+            (UIState::EditSwing { acc }, _, Event::Key(Key::Backspace)) => *acc /= 10,
+            (&mut UIState::EditSwing { acc }, _, Event::Key(Key::Char('\n'))) => {
+                self.swing = acc.min(9);
+                self.state = UIState::EditSteps;
+            }
+
             _ => (),
         };
         true
+    }
+    fn render_to_backend(&self) -> Result<(), SendError<Song>> {
+        if let Some(backend) = self.backend {
+            let events = {
+                let mut events: Vec<_> = self
+                    .tracks
+                    .iter()
+                    .flat_map(move |(note, steps)| {
+                        steps
+                            .iter()
+                            .enumerate()
+                            .filter(|(_index, step)| **step)
+                            .map(move |(index, _step)| midi::Event {
+                                time: index as f64 / steps.len() as f64,
+                                channel: 9,
+                                fields: EventFields::Note {
+                                    note: *note,
+                                    velocity: 127,
+                                    duration: 0.5 / steps.len() as f64,
+                                    chance_to_fire: 1.0,
+                                },
+                            })
+                    })
+                    .collect();
+                events.sort_unstable();
+                events
+            };
+            let sections = vec![Section {
+                next_section: None,
+                events,
+            }];
+            backend.song_tx().send(Song {
+                bpm: if self.paused { 0 } else { self.bpm },
+                swing: self.swing as f64 / 9.0,
+                sections,
+            })?;
+        }
+        Ok(())
     }
     fn write<W>(&self, writer: &mut W, width: u16, height: u16) -> std::io::Result<()>
     where
@@ -131,11 +233,9 @@ impl UI {
         // Render state.
         write!(writer, "{}", cursor::Goto(1, 1))?;
         for (track, (note, steps)) in self.tracks.iter().enumerate() {
+            let track_is_focused = self.focused_track == track;
             let note = match self.state {
-                UIState::EditNote {
-                    track: focused_track,
-                    acc,
-                } if track == focused_track => {
+                UIState::EditNote { acc } if track_is_focused => {
                     write!(
                         writer,
                         "{}{}",
@@ -154,14 +254,7 @@ impl UI {
                 color::Bg(color::Reset),
             )?;
             let active_step = (self.clock * steps.len() as f64) as usize;
-            let focused = match self.state {
-                UIState::EditSteps {
-                    track: focused_track,
-                    ..
-                } => focused_track == track,
-                _ => false,
-            };
-            if focused {
+            if track_is_focused {
                 write!(
                     writer,
                     "{}{}",
@@ -175,7 +268,18 @@ impl UI {
                     (false, true) => '.',
                     (_, false) => ' ',
                 };
-                write!(writer, " {}", ch)?;
+                if track_is_focused && self.focused_step == step {
+                    write!(
+                        writer,
+                        "{}{} {}{}",
+                        color::Fg(color::Black),
+                        color::Bg(color::Red),
+                        ch,
+                        color::Bg(color::Blue)
+                    )?;
+                } else {
+                    write!(writer, " {}", ch)?;
+                }
             }
             write!(
                 writer,
@@ -187,13 +291,54 @@ impl UI {
         }
         write!(
             writer,
-            "{}{} - {:.2}",
+            "{}{} {:.2}",
             cursor::Goto(width / 2, height / 2),
-            self.bpm,
+            if self.paused { "||" } else { " >" },
             self.clock,
         )?;
+        let bpm = if let UIState::EditBpm { acc } = self.state {
+            write!(
+                writer,
+                "{}{}",
+                color::Fg(color::Black),
+                color::Bg(color::Red)
+            )?;
+            acc
+        } else {
+            self.bpm
+        };
+        write!(
+            writer,
+            " bpm={:3}{}{}",
+            bpm,
+            color::Fg(color::Reset),
+            color::Bg(color::Reset),
+        )?;
+        let swing = if let UIState::EditSwing { acc } = self.state {
+            write!(
+                writer,
+                "{}{}",
+                color::Fg(color::Black),
+                color::Bg(color::Red)
+            )?;
+            acc
+        } else {
+            self.swing
+        };
+        write!(
+            writer,
+            " swing={}{}{}",
+            swing,
+            color::Fg(color::Reset),
+            color::Bg(color::Reset),
+        )?;
         if let UIState::Err(err) = &self.state {
-            write!(writer, "{}{}", cursor::Goto(width / 2, height / 2 + 1), err)?;
+            write!(
+                writer,
+                "{}ERROR -> {}",
+                cursor::Goto(width / 2, height / 2 + 1),
+                err
+            )?;
         }
         writer.flush()?;
         Ok(())
@@ -201,8 +346,7 @@ impl UI {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (error_tx, error_rx): (Sender<Box<dyn Error + Send>>, Receiver<_>) = crossbeam::bounded(0);
-    let backend = JackBackend::<(), ()>::new(error_tx.clone())?;
+    let backend = JackBackend::<(), ()>::new()?;
 
     /*
     let song = {
@@ -221,7 +365,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         let stdout = HideCursor::from(stdout);
         stdout
     };
-    let (event_tx, event_rx) = crossbeam::unbounded();
+    let (error_tx, error_rx): (Sender<Box<dyn Error + Send>>, Receiver<_>) = crossbeam::bounded(0);
+    let (event_tx, event_rx) = crossbeam::bounded(0);
     spawn(move || {
         for event in stdin.events() {
             let event = match event {
@@ -238,13 +383,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     });
     let mut ui = UI {
+        paused: true,
         bpm: 60,
+        swing: 0,
         tracks: Vec::new(),
-        state: UIState::EditSteps { track: 0 },
+        state: UIState::EditSteps,
+        focused_track: 0,
+        focused_step: 0,
         clock: 0.0,
+        backend: Some(&backend),
     };
     let (mut width, mut height) = termion::terminal_size()?;
-    while ui.step(&event_rx, &error_rx, &backend) {
+    while ui.step(&event_rx, &error_rx) {
         let (new_width, new_height) = termion::terminal_size()?;
         if (width, height) != (new_width, new_height) {
             write!(stdout, "{}", clear::All)?;

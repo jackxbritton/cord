@@ -1,4 +1,4 @@
-use crossbeam::{Receiver, Sender};
+use crossbeam::{Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ord, Ordering};
 use std::collections::VecDeque;
@@ -7,7 +7,6 @@ use std::error::Error;
 use std::f64::consts::PI;
 use std::io::Read;
 use std::ops::Range;
-use std::thread::spawn;
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -309,6 +308,7 @@ pub trait Backend {
     fn song_tx(&self) -> &Sender<Song>;
     fn quit_tx(&self) -> &Sender<()>;
     fn clock_rx(&self) -> &Receiver<f64>;
+    fn fatal_rx(&self) -> &Receiver<Box<dyn Error + Send + Sync>>;
 }
 
 pub struct JackBackend<N, P> {
@@ -317,6 +317,7 @@ pub struct JackBackend<N, P> {
     song_tx: Sender<Song>,
     quit_tx: Sender<()>,
     clock_rx: Receiver<f64>, // TODO(jack) Add current_section, note state, etc. to this!
+    fatal_rx: Receiver<Box<dyn Error + Send + Sync>>,
 }
 
 impl<N, P> Backend for JackBackend<N, P> {
@@ -329,31 +330,21 @@ impl<N, P> Backend for JackBackend<N, P> {
     fn clock_rx(&self) -> &Receiver<f64> {
         &self.clock_rx
     }
+    fn fatal_rx(&self) -> &Receiver<Box<dyn Error + Send + Sync>> {
+        &self.fatal_rx
+    }
 }
-
-// impl<N, P> jack::NotificationHandler for JackBackend<N, P> {
-//     fn shutdown(&mut self, _status: jack::ClientStatus, _reason: &str) {}
-// }
 
 impl<N, P> JackBackend<N, P> {
     pub fn new(
-        error_tx: Sender<Box<dyn Error + Send>>,
     ) -> Result<JackBackend<impl jack::NotificationHandler, impl jack::ProcessHandler>, jack::Error>
     {
-        let (song_tx, song_rx) = crossbeam::bounded(0);
-        let (quit_tx, quit_rx) = crossbeam::bounded(0);
+        let (song_tx, song_rx) = crossbeam::unbounded();
+        let (quit_tx, quit_rx) = crossbeam::unbounded();
         let mut quit = false;
         let (clock_tx, clock_rx) = crossbeam::bounded(256);
-
-        let (jack_error_tx, jack_error_rx): (Sender<jack::Error>, Receiver<_>) =
-            crossbeam::bounded(32);
-        spawn(move || {
-            for err in jack_error_rx {
-                if error_tx.send(Box::new(err)).is_err() {
-                    break;
-                }
-            }
-        });
+        let (fatal_tx, fatal_rx): (Sender<Box<dyn Error + Send + Sync>>, Receiver<_>) =
+            crossbeam::bounded(1);
 
         let (client, _) = jack::Client::new(
             "cord",
@@ -385,7 +376,7 @@ impl<N, P> JackBackend<N, P> {
                                 Ok(()) => (),
                                 Err(jack::Error::NotEnoughSpace) => return jack::Control::Continue,
                                 Err(err) => {
-                                    jack_error_tx.send(err).ok();
+                                    fatal_tx.send(err.into()).ok();
                                     return jack::Control::Quit;
                                 }
                             };
@@ -398,12 +389,12 @@ impl<N, P> JackBackend<N, P> {
                     Ok(()) => (),
                     Err(jack::Error::NotEnoughSpace) => return jack::Control::Continue,
                     Err(err) => {
-                        jack_error_tx.send(err).ok();
+                        fatal_tx.send(err.into()).ok();
                         return jack::Control::Quit;
                     }
                 }
 
-                if let Err(err) = clock_tx.try_send(playback.clock) {
+                if let Err(TrySendError::Disconnected(_)) = clock_tx.try_send(playback.clock) {
                     return jack::Control::Quit;
                 }
 
@@ -415,6 +406,7 @@ impl<N, P> JackBackend<N, P> {
             song_tx,
             quit_tx,
             clock_rx,
+            fatal_rx,
         })
     }
 }

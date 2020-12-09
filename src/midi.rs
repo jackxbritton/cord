@@ -7,12 +7,11 @@ use std::error::Error;
 use std::f64::consts::PI;
 use std::io::Read;
 use std::ops::Range;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::Relaxed;
+use std::thread::spawn;
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(untagged)]
-enum EventFields {
+pub enum EventFields {
     Note {
         note: u8,
         velocity: u8,
@@ -26,11 +25,11 @@ enum EventFields {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
-struct Event {
-    time: f64,
-    channel: u8,
+pub struct Event {
+    pub time: f64,
+    pub channel: u8,
     #[serde(flatten)]
-    fields: EventFields,
+    pub fields: EventFields,
 }
 
 impl Eq for Event {}
@@ -41,16 +40,16 @@ impl Ord for Event {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
-struct Section {
-    next_section: Option<usize>,
-    events: Vec<Event>,
+pub struct Section {
+    pub next_section: Option<usize>,
+    pub events: Vec<Event>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct Song {
-    bpm: u8,
-    swing: f64,
-    sections: Vec<Section>,
+    pub bpm: u32,
+    pub swing: f64,
+    pub sections: Vec<Section>,
 }
 
 impl Song {
@@ -306,27 +305,55 @@ impl Playback {
     }
 }
 
-struct NotificationHandler;
-impl jack::NotificationHandler for NotificationHandler {}
-
-pub struct JackBackend<P> {
-    #[allow(dead_code)]
-    async_client: jack::AsyncClient<NotificationHandler, P>,
-    pub song_tx: Sender<Song>,
-    pub quit_tx: Sender<()>,
-    pub error_rx: Receiver<String>,
-    pub clock_rx: Receiver<f64>, // TODO(jack) Add current_section, note state, etc. to this!
+pub trait Backend {
+    fn song_tx(&self) -> &Sender<Song>;
+    fn quit_tx(&self) -> &Sender<()>;
+    fn clock_rx(&self) -> &Receiver<f64>;
 }
 
-impl<P> JackBackend<P> {
+pub struct JackBackend<N, P> {
+    #[allow(dead_code)]
+    async_client: jack::AsyncClient<N, P>,
+    song_tx: Sender<Song>,
+    quit_tx: Sender<()>,
+    clock_rx: Receiver<f64>, // TODO(jack) Add current_section, note state, etc. to this!
+}
+
+impl<N, P> Backend for JackBackend<N, P> {
+    fn song_tx(&self) -> &Sender<Song> {
+        &self.song_tx
+    }
+    fn quit_tx(&self) -> &Sender<()> {
+        &self.quit_tx
+    }
+    fn clock_rx(&self) -> &Receiver<f64> {
+        &self.clock_rx
+    }
+}
+
+// impl<N, P> jack::NotificationHandler for JackBackend<N, P> {
+//     fn shutdown(&mut self, _status: jack::ClientStatus, _reason: &str) {}
+// }
+
+impl<N, P> JackBackend<N, P> {
     pub fn new(
-        running_flag: &'static AtomicBool,
-    ) -> Result<JackBackend<impl jack::ProcessHandler>, jack::Error> {
+        error_tx: Sender<Box<dyn Error + Send>>,
+    ) -> Result<JackBackend<impl jack::NotificationHandler, impl jack::ProcessHandler>, jack::Error>
+    {
         let (song_tx, song_rx) = crossbeam::bounded(0);
         let (quit_tx, quit_rx) = crossbeam::bounded(0);
         let mut quit = false;
-        let (error_tx, error_rx) = crossbeam::bounded(32);
         let (clock_tx, clock_rx) = crossbeam::bounded(256);
+
+        let (jack_error_tx, jack_error_rx): (Sender<jack::Error>, Receiver<_>) =
+            crossbeam::bounded(32);
+        spawn(move || {
+            for err in jack_error_rx {
+                if error_tx.send(Box::new(err)).is_err() {
+                    break;
+                }
+            }
+        });
 
         let (client, _) = jack::Client::new(
             "cord",
@@ -346,7 +373,7 @@ impl<P> JackBackend<P> {
                 if let Some(new_song) = song_rx.try_iter().last() {
                     playback.song = new_song;
                 };
-                quit = quit || quit_rx.try_recv().is_ok();
+                quit = quit_rx.try_recv().is_ok() || quit;
 
                 let mut writer = output_port.writer(ps);
 
@@ -355,36 +382,38 @@ impl<P> JackBackend<P> {
                     while let Some(midi_event) = playback.midi_event_queue.pop_front() {
                         if let MidiEventFields::NoteOff { .. } = midi_event.fields {
                             match playback.write_midi_event(&mut writer, midi_event, 0) {
+                                Ok(()) => (),
                                 Err(jack::Error::NotEnoughSpace) => return jack::Control::Continue,
                                 Err(err) => {
-                                    error_tx.send(err.to_string()).ok();
+                                    jack_error_tx.send(err).ok();
                                     return jack::Control::Quit;
                                 }
-                                Ok(()) => (),
                             };
                         }
                     }
                 }
 
+                // Otherwise, just step the playback.
                 match playback.step(&mut writer, buffer_period) {
                     Ok(()) => (),
                     Err(jack::Error::NotEnoughSpace) => return jack::Control::Continue,
                     Err(err) => {
-                        error_tx.send(err.to_string()).ok();
+                        jack_error_tx.send(err).ok();
                         return jack::Control::Quit;
                     }
                 }
 
-                clock_tx.try_send(playback.clock).ok();
+                if let Err(err) = clock_tx.try_send(playback.clock) {
+                    return jack::Control::Quit;
+                }
 
                 jack::Control::Continue
             });
-        let async_client = client.activate_async(NotificationHandler, process_handler)?;
+        let async_client = client.activate_async((), process_handler)?;
         Ok(JackBackend {
             async_client,
             song_tx,
             quit_tx,
-            error_rx,
             clock_rx,
         })
     }

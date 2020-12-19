@@ -304,34 +304,26 @@ impl Playback {
     }
 }
 
+pub struct BackendChannels {
+    pub song_tx: Sender<Song>,
+    pub quit_tx: Sender<()>,
+    pub clock_rx: Receiver<f64>,
+    pub fatal_rx: Receiver<Box<dyn Error + Send + Sync>>,
+}
+
 pub trait Backend {
-    fn song_tx(&self) -> &Sender<Song>;
-    fn quit_tx(&self) -> &Sender<()>;
-    fn clock_rx(&self) -> &Receiver<f64>;
-    fn fatal_rx(&self) -> &Receiver<Box<dyn Error + Send + Sync>>;
+    fn channels(&self) -> &BackendChannels;
 }
 
 pub struct JackBackend<N, P> {
     #[allow(dead_code)]
     async_client: jack::AsyncClient<N, P>,
-    song_tx: Sender<Song>,
-    quit_tx: Sender<()>,
-    clock_rx: Receiver<f64>, // TODO(jack) Add current_section, note state, etc. to this!
-    fatal_rx: Receiver<Box<dyn Error + Send + Sync>>,
+    channels: BackendChannels,
 }
 
 impl<N, P> Backend for JackBackend<N, P> {
-    fn song_tx(&self) -> &Sender<Song> {
-        &self.song_tx
-    }
-    fn quit_tx(&self) -> &Sender<()> {
-        &self.quit_tx
-    }
-    fn clock_rx(&self) -> &Receiver<f64> {
-        &self.clock_rx
-    }
-    fn fatal_rx(&self) -> &Receiver<Box<dyn Error + Send + Sync>> {
-        &self.fatal_rx
+    fn channels(&self) -> &BackendChannels {
+        &self.channels
     }
 }
 
@@ -394,7 +386,9 @@ impl<N, P> JackBackend<N, P> {
                     }
                 }
 
-                if let Err(TrySendError::Disconnected(_)) = clock_tx.try_send(playback.clock) {
+                if let Err(TrySendError::Disconnected(_)) =
+                    clock_tx.try_send(playback.apply_swing_to_clock(playback.clock))
+                {
                     return jack::Control::Quit;
                 }
 
@@ -403,10 +397,12 @@ impl<N, P> JackBackend<N, P> {
         let async_client = client.activate_async((), process_handler)?;
         Ok(JackBackend {
             async_client,
-            song_tx,
-            quit_tx,
-            clock_rx,
-            fatal_rx,
+            channels: BackendChannels {
+                song_tx,
+                quit_tx,
+                clock_rx,
+                fatal_rx,
+            },
         })
     }
 }

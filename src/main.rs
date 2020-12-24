@@ -1,21 +1,27 @@
-mod midi;
+mod backend;
 mod music;
 
-use midi::*;
+use backend::jack::*;
+use backend::*;
 use music::*;
 
 use crossbeam::select;
 use crossbeam::{Receiver, SendError, Sender};
 use std::error::Error;
 use std::io::{stdin, stdout, Write};
+use std::iter::repeat;
 use std::thread::{sleep, spawn};
 use std::time::Duration;
 use termion::cursor::HideCursor;
-use termion::event::{Event, Key, MouseEvent};
+use termion::event::{Event, Key};
 use termion::input::{MouseTerminal, TermRead};
 use termion::raw::IntoRawMode;
 use termion::screen::AlternateScreen;
-use termion::{clear, color, cursor, style};
+use termion::{clear, color, cursor};
+
+// TODO(jack)
+// sections
+// undo / redo
 
 enum FieldUpdateResult<T> {
     Ready(T),
@@ -58,11 +64,13 @@ impl Field<u32> for UnsignedField {
         FieldUpdateResult::NotReady
     }
 }
+
 #[derive(Copy, Clone)]
 struct KeyField {
     tonic: Option<char>,
     accidental: Option<Accidental>,
     mode: Mode,
+    octave: Option<u8>,
 }
 
 impl KeyField {
@@ -71,6 +79,7 @@ impl KeyField {
             tonic: None,
             accidental: None,
             mode: Mode::Major,
+            octave: None,
         }
     }
 }
@@ -78,6 +87,7 @@ impl Field<music::Key> for KeyField {
     fn update(&mut self, event: &Event) -> FieldUpdateResult<music::Key> {
         match (*self, event) {
             (_, Event::Key(Key::Esc)) => return FieldUpdateResult::Cancel,
+
             (Self { tonic: None, .. }, &Event::Key(Key::Char(ch @ 'a'..='g'))) => {
                 self.tonic = Some(ch)
             }
@@ -101,32 +111,47 @@ impl Field<music::Key> for KeyField {
             ) => {
                 self.accidental = Some(Accidental::Sharp);
             }
-            (Self { tonic: Some(_), .. }, &Event::Key(Key::Char('m'))) => {
+            (
+                Self {
+                    tonic: Some(_),
+                    octave: None,
+                    ..
+                },
+                &Event::Key(Key::Char('m')),
+            ) => {
                 self.mode = Mode::Minor;
+            }
+            (Self { tonic: Some(_), .. }, &Event::Key(Key::Char(ch @ '0'..='9'))) => {
+                self.octave = Some(ch.to_digit(10).unwrap() as u8);
             }
 
             // Backspace.
             (
                 Self {
-                    tonic: Some(_),
-                    mode: Mode::Minor,
-                    ..
+                    octave: Some(_), ..
                 },
-                &Event::Key(Key::Backspace),
+                Event::Key(Key::Backspace),
+            ) => {
+                self.octave = None;
+            }
+            (
+                Self {
+                    mode: Mode::Minor, ..
+                },
+                Event::Key(Key::Backspace),
             ) => {
                 self.mode = Mode::Major;
             }
             (
                 Self {
-                    tonic: Some(_),
                     accidental: Some(_),
                     ..
                 },
-                &Event::Key(Key::Backspace),
+                Event::Key(Key::Backspace),
             ) => {
                 self.accidental = None;
             }
-            (Self { tonic: Some(_), .. }, &Event::Key(Key::Backspace)) => {
+            (Self { tonic: Some(_), .. }, Event::Key(Key::Backspace)) => {
                 self.tonic = None;
             }
 
@@ -135,6 +160,7 @@ impl Field<music::Key> for KeyField {
                     tonic: Some(tonic),
                     accidental,
                     mode,
+                    octave: Some(octave),
                 },
                 Event::Key(Key::Char('\n')),
             ) => {
@@ -142,6 +168,7 @@ impl Field<music::Key> for KeyField {
                     tonic,
                     accidental,
                     mode,
+                    octave,
                 });
             }
             _ => (),
@@ -151,289 +178,94 @@ impl Field<music::Key> for KeyField {
 }
 
 enum UiState {
+    EditSection,
+
+    AddChannel(UnsignedField),
+    EditChannel(UnsignedField),
+    AddNote(UnsignedField),
+    EditNote(UnsignedField),
+
+    ConstrainToKey(KeyField),
+
     EditBpm(UnsignedField),
     EditSwing(UnsignedField),
+    EditProgram(UnsignedField),
+
     Err(Box<dyn Error>),
-
-    EditSong,
 }
 
 #[derive(Copy, Clone)]
-struct PercussionStep {
-    on: bool,
-}
-
-struct PercussionTrack {
-    note: u8,
-    steps: [PercussionStep; 16],
-}
-
-enum PercussionState {
-    EditSteps,
-    EditNote(UnsignedField),
-}
-
-struct Percussion {
-    tracks: Vec<PercussionTrack>,
-    focused_track: usize,
-    focused_step: usize,
-    state: PercussionState,
-}
-
-trait Update {
-    // Return true if the event was consumed.
-    fn update(&mut self, event: &Event) -> bool;
-}
-
-impl Update for Percussion {
-    fn update(&mut self, event: &Event) -> bool {
-        match &mut self.state {
-            PercussionState::EditSteps => match event {
-                Event::Key(Key::Char('p')) => {
-                    let track = PercussionTrack {
-                        note: 0,
-                        steps: [PercussionStep { on: false }; 16],
-                    };
-                    if self.focused_track + 1 >= self.tracks.len() {
-                        self.tracks.push(track);
-                        self.focused_track = self.tracks.len() - 1;
-                    } else {
-                        self.tracks.insert(self.focused_track + 1, track);
-                        self.focused_track += 1;
-                    }
-                }
-                _ if self.tracks.len() == 0 => return false,
-                Event::Key(Key::Delete) => {
-                    self.tracks.remove(self.focused_track);
-                    let last_index = self.tracks.len().checked_sub(1);
-                    self.focused_track = self.focused_track.min(last_index.unwrap_or(0))
-                }
-                Event::Key(Key::Char('j')) => {
-                    self.focused_track = (self.focused_track + 1).min(self.tracks.len() - 1)
-                }
-                Event::Key(Key::Char('k')) => {
-                    self.focused_track = self.focused_track.checked_sub(1).unwrap_or(0)
-                }
-                Event::Key(Key::Char('^')) => {
-                    self.focused_step = 0;
-                }
-                Event::Key(Key::Char('$')) => {
-                    self.focused_step = self.tracks[self.focused_track].steps.len() - 1;
-                }
-                Event::Key(Key::Char('l')) => {
-                    self.focused_step =
-                        (self.focused_step + 1).min(self.tracks[self.focused_track].steps.len() - 1)
-                }
-                Event::Key(Key::Char('h')) => {
-                    self.focused_step = self.focused_step.checked_sub(1).unwrap_or(0)
-                }
-                Event::Key(Key::Char('g')) => {
-                    self.focused_track = 0;
-                }
-                Event::Key(Key::Char('G')) => self.focused_track = self.tracks.len() - 1,
-                Event::Key(Key::Char('.')) => {
-                    let step = &mut self.tracks[self.focused_track].steps[self.focused_step];
-                    step.on = !step.on;
-                }
-                Event::Key(Key::Char('>')) => {
-                    let on = !self.tracks[self.focused_track]
-                        .steps
-                        .iter()
-                        .any(|step| step.on);
-                    for step in &mut self.tracks[self.focused_track].steps {
-                        step.on = on;
-                    }
-                }
-                Event::Key(Key::Char('n')) => {
-                    self.state = PercussionState::EditNote(UnsignedField::new(10, 127))
-                }
-                _ => return false,
-            },
-            PercussionState::EditNote(acc) => match acc.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(note) => {
-                    self.tracks[self.focused_track].note = note as u8;
-                    self.state = PercussionState::EditSteps;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = PercussionState::EditSteps;
-                }
-            },
-        };
-        true
-    }
-}
-
-struct MelodyTrack {
-    channel: u8,
-    steps: [MelodyStep; 16],
-}
-
-#[derive(Copy, Clone)]
-enum MelodyStep {
-    On { degree: u8 },
+enum Step {
     Hold,
     Off,
+    On,
+}
+#[derive(Copy, Clone)]
+struct Track {
+    steps: [Step; 16],
+    mute: bool,
 }
 
-enum MelodyState {
-    EditSteps,
-    EditChannel(UnsignedField),
-    EditKey(KeyField),
+struct Section {
+    tracks: [[Option<Track>; 128]; 16],
 }
 
-struct Melody {
-    state: MelodyState,
-    tracks: Vec<MelodyTrack>,
-    focused_track: usize,
-    focused_step: usize,
-    key: music::Key,
-}
-
-impl Update for Melody {
-    fn update(&mut self, event: &Event) -> bool {
-        match &mut self.state {
-            MelodyState::EditSteps => match event {
-                Event::Key(Key::Char('m')) => {
-                    let track = MelodyTrack {
-                        channel: 0,
-                        steps: [MelodyStep::Off; 16],
-                    };
-                    if self.focused_track + 1 >= self.tracks.len() {
-                        self.tracks.push(track);
-                        self.focused_track = self.tracks.len() - 1;
-                    } else {
-                        self.tracks.insert(self.focused_track + 1, track);
-                        self.focused_track += 1;
-                    }
-                }
-                _ if self.tracks.len() == 0 => return false,
-                Event::Key(Key::Delete) => {
-                    self.tracks.remove(self.focused_track);
-                    let last_index = self.tracks.len().checked_sub(1);
-                    self.focused_track = self.focused_track.min(last_index.unwrap_or(0))
-                }
-                Event::Key(Key::Char('j')) => {
-                    self.focused_track = (self.focused_track + 1).min(self.tracks.len() - 1)
-                }
-                Event::Key(Key::Char('k')) => {
-                    self.focused_track = self.focused_track.checked_sub(1).unwrap_or(0)
-                }
-                Event::Key(Key::Char('^')) => {
-                    self.focused_step = 0;
-                }
-                Event::Key(Key::Char('$')) => {
-                    self.focused_step = self.tracks[self.focused_track].steps.len() - 1;
-                }
-                Event::Key(Key::Char('l')) => {
-                    self.focused_step =
-                        (self.focused_step + 1).min(self.tracks[self.focused_track].steps.len() - 1)
-                }
-                Event::Key(Key::Char('h')) => {
-                    self.focused_step = self.focused_step.checked_sub(1).unwrap_or(0)
-                }
-                Event::Key(Key::Char('g')) => {
-                    self.focused_track = 0;
-                }
-                Event::Key(Key::Char('G')) => self.focused_track = self.tracks.len() - 1,
-                Event::Key(Key::Char('c')) => {
-                    self.state = MelodyState::EditChannel(UnsignedField::new(10, 127))
-                }
-                &Event::Key(Key::Char(ch @ '0'..='9')) => {
-                    let degree = ch.to_digit(10).unwrap() as u8;
-                    self.tracks[self.focused_track].steps[self.focused_step] =
-                        MelodyStep::On { degree };
-                    self.focused_step = (self.focused_step + 1)
-                        .min(self.tracks[self.focused_track].steps.len() - 1);
-                }
-                Event::Key(Key::Char('K')) => self.state = MelodyState::EditKey(KeyField::new()),
-                &Event::Key(Key::Char('-')) => {
-                    let steps = &mut self.tracks[self.focused_track].steps;
-                    let previous_step_index =
-                        self.focused_step.checked_sub(1).unwrap_or(steps.len() - 1);
-                    match steps[previous_step_index] {
-                        MelodyStep::Off => (),
-                        _ => {
-                            steps[self.focused_step] = MelodyStep::Hold;
-                            self.focused_step = (self.focused_step + 1).min(steps.len() - 1);
-                        }
-                    };
-                }
-                &Event::Key(Key::Char('.')) => {
-                    let step = &mut self.tracks[self.focused_track].steps[self.focused_step];
-                    *step = match *step {
-                        MelodyStep::Off => MelodyStep::On { degree: 0 },
-                        _ => MelodyStep::Off,
-                    };
-                    self.focused_step = (self.focused_step + 1)
-                        .min(self.tracks[self.focused_track].steps.len() - 1);
-                }
-                _ => return false,
-            },
-            MelodyState::EditChannel(acc) => match acc.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(channel) => {
-                    self.tracks[self.focused_track].channel = channel as u8;
-                    self.state = MelodyState::EditSteps;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = MelodyState::EditSteps;
-                }
-            },
-            MelodyState::EditKey(acc) => match acc.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(key) => {
-                    self.key = key;
-                    self.state = MelodyState::EditSteps;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = MelodyState::EditSteps;
-                }
-            },
-        };
-        true
+impl Section {
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (usize, usize, &Track)> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .flat_map(move |(channel, tracks)| {
+                tracks.iter().enumerate().filter_map(move |(note, track)| {
+                    track.as_ref().map(|track| (channel, note, track))
+                })
+            })
     }
-}
-
-enum SongState {
-    EditPercussion,
-    EditMelody,
-}
-
-struct Song {
-    state: SongState,
-    percussion: Percussion,
-    melody: Melody,
-}
-
-impl Update for Song {
-    fn update(&mut self, event: &Event) -> bool {
-        let consumed = match &self.state {
-            SongState::EditPercussion => self.percussion.update(&event),
-            SongState::EditMelody => self.melody.update(&event),
-        };
-        if consumed {
-            return true;
-        }
-        match &event {
-            Event::Key(Key::Char('p')) => self.state = SongState::EditPercussion,
-            Event::Key(Key::Char('m')) => self.state = SongState::EditMelody,
-            _ => return false,
-        }
-        true
+    fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (usize, usize, &mut Track)> {
+        self.tracks
+            .iter_mut()
+            .enumerate()
+            .flat_map(move |(channel, tracks)| {
+                tracks
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(move |(note, track)| {
+                        track.as_mut().map(|track| (channel, note, track))
+                    })
+            })
+    }
+    fn iter_channel(&self, channel: usize) -> impl DoubleEndedIterator<Item = (usize, &Track)> {
+        self.tracks[channel]
+            .iter()
+            .enumerate()
+            .filter_map(move |(note, track)| track.as_ref().map(|track| (note, track)))
+    }
+    fn iter_channel_mut(
+        &mut self,
+        channel: usize,
+    ) -> impl DoubleEndedIterator<Item = (usize, &mut Track)> {
+        self.tracks[channel]
+            .iter_mut()
+            .enumerate()
+            .filter_map(move |(note, track)| track.as_mut().map(|track| (note, track)))
     }
 }
 
 struct Ui {
-    paused: bool,
     bpm: u32,
     swing: u32,
 
-    clock: f64,
+    paused: bool,
+    playback_state: backend::PlaybackState,
     backend: Option<Box<dyn Backend>>,
 
     state: UiState,
-    song: Song,
+    sections: Vec<Section>,
+    programs: [u8; 16],
+    focused_section: usize,
+    focused_channel: usize,
+    focused_note: usize,
+    focused_step: usize,
 }
 
 impl Ui {
@@ -456,8 +288,11 @@ impl Ui {
         error_rx: &Receiver<Box<dyn Error + Send>>,
     ) -> Result<bool, Box<dyn Error>> {
         let nevers = (crossbeam::channel::never(), crossbeam::channel::never());
-        let (clock_rx, fatal_rx) = if let Some(backend) = &self.backend {
-            (&backend.channels().clock_rx, &backend.channels().fatal_rx)
+        let (playback_state_rx, fatal_rx) = if let Some(backend) = &self.backend {
+            (
+                &backend.channels().playback_state_rx,
+                &backend.channels().fatal_rx,
+            )
         } else {
             (&nevers.0, &nevers.1)
         };
@@ -471,10 +306,9 @@ impl Ui {
                 }
 
                 self.render_to_backend()?;
-
             },
             recv(error_rx) -> err => return Err(err?),
-            recv(clock_rx) -> clock => self.clock = clock?,
+            recv(playback_state_rx) -> playback_state => self.playback_state = playback_state?,
             recv(fatal_rx) -> err => {
                 self.backend = None;
                 return Err(err?);
@@ -483,372 +317,626 @@ impl Ui {
         Ok(true)
     }
     fn handle_input(&mut self, event: Event) -> bool {
-        if let Event::Key(Key::Ctrl('c')) = event {
-            return false;
-        }
-        let consumed = match self.state {
-            UiState::EditSong => self.song.update(&event),
-            // TODO(jack) Update bpm, swing, here. How to propogate state change?
-            // We need to signal from `update` that it's exited.
-            _ => false,
-        };
-        if consumed {
-            return true;
-        }
-        // Global controls.
+        let section = &mut self.sections[self.focused_section];
+        let (focused_channel, focused_note) = (self.focused_channel, self.focused_note);
         match (&mut self.state, &event) {
+            (_, Event::Key(Key::Ctrl('c'))) => return false,
             (_, Event::Key(Key::Char(' '))) => self.paused = !self.paused,
 
-            // Edit bpm.
-            (_, Event::Key(Key::Char('b'))) => {
-                self.state = UiState::EditBpm(UnsignedField::new(10, 300))
+            (UiState::EditSection, Event::Key(Key::Char('C'))) => {
+                self.state = UiState::AddChannel(UnsignedField::new(10, 15))
             }
-            (UiState::EditBpm(acc), event) => match acc.update(event) {
+            (UiState::AddChannel(field), event) => match field.update(event) {
                 FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(bpm) => {
-                    self.bpm = bpm;
-                    self.state = UiState::EditSong;
+                FieldUpdateResult::Ready(channel) => {
+                    self.focused_channel = channel as usize;
+                    let first_track = section.iter_channel(self.focused_channel).next();
+                    self.focused_note = if let Some((note, _)) = first_track {
+                        note
+                    } else {
+                        section.tracks[self.focused_channel][0] = Some(Track {
+                            mute: false,
+                            steps: [Step::Off; 16],
+                        });
+                        0
+                    };
+                    self.state = UiState::EditSection;
                 }
                 FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSong;
+                    self.state = UiState::EditSection;
                 }
             },
 
-            (_, Event::Key(Key::Char('s'))) => {
+            (UiState::EditSection, Event::Key(Key::Char('c'))) => {
+                if let Some(_) = self.sections[self.focused_section].tracks[self.focused_channel]
+                    [self.focused_note]
+                {
+                    self.state = UiState::EditChannel(UnsignedField::new(10, 15));
+                }
+            }
+            (UiState::EditChannel(field), event) => match field.update(event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(channel) => {
+                    let new_channel = channel as usize;
+                    section.tracks[new_channel] = section.tracks[self.focused_channel];
+                    section.tracks[self.focused_channel] = [None; 128];
+                    self.focused_channel = new_channel;
+                    self.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.state = UiState::EditSection;
+                }
+            },
+
+            (UiState::EditSection, Event::Key(Key::Char('N'))) => {
+                if section.iter_channel(self.focused_channel).next().is_some() {
+                    self.state = UiState::AddNote(UnsignedField::new(10, 127))
+                }
+            }
+            (UiState::AddNote(field), event) => match field.update(event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(note) => {
+                    self.focused_note = note as usize;
+                    if self.sections[self.focused_section].tracks[self.focused_channel]
+                        [self.focused_note]
+                        .is_none()
+                    {
+                        self.sections[self.focused_section].tracks[self.focused_channel]
+                            [self.focused_note] = Some(Track {
+                            mute: false,
+                            steps: [Step::Off; 16],
+                        });
+                    }
+                    self.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.state = UiState::EditSection;
+                }
+            },
+
+            (UiState::EditSection, Event::Key(Key::Char('n'))) => {
+                if let Some(_) = section.tracks[self.focused_channel][self.focused_note] {
+                    self.state = UiState::EditNote(UnsignedField::new(10, 127))
+                }
+            }
+            (UiState::EditNote(field), event) => match field.update(event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(note) => {
+                    let new_note = note as usize;
+                    section.tracks[self.focused_channel][new_note] =
+                        section.tracks[self.focused_channel][self.focused_note].take();
+                    self.focused_note = new_note;
+                    self.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.state = UiState::EditSection;
+                }
+            },
+
+            (UiState::EditSection, Event::Key(Key::Char('p'))) => {
+                self.state = UiState::EditProgram(UnsignedField::new(10, 127));
+            }
+            (UiState::EditProgram(field), event) => match field.update(event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(program) => {
+                    self.programs[self.focused_channel as usize] = program as u8;
+                    self.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.state = UiState::EditSection;
+                }
+            },
+
+            // Mute / solo track / channel.
+            (UiState::EditSection, Event::Key(Key::Char('m'))) => {
+                if let Some(track) = &mut section.tracks[self.focused_channel][self.focused_note] {
+                    track.mute = !track.mute;
+                }
+            }
+            (UiState::EditSection, Event::Key(Key::Char('M'))) => {
+                let mute = section
+                    .iter_channel(self.focused_channel)
+                    .any(|(_, track)| !track.mute);
+                for (_, track) in section.iter_channel_mut(self.focused_channel) {
+                    track.mute = mute;
+                }
+            }
+            (UiState::EditSection, Event::Key(Key::Char('s'))) => {
+                if section
+                    .iter_channel(self.focused_channel)
+                    .all(|(note, track)| track.mute == (note != focused_note))
+                {
+                    for (_, track) in section.iter_channel_mut(self.focused_channel) {
+                        track.mute = false;
+                    }
+                } else {
+                    for (note, track) in section.iter_channel_mut(self.focused_channel) {
+                        track.mute = note != self.focused_note;
+                    }
+                }
+            }
+            (UiState::EditSection, Event::Key(Key::Char('S'))) => {
+                let mute_all = section
+                    .iter()
+                    .all(|(channel, _, track)| track.mute == (channel != focused_channel));
+                for (channel, _, track) in section.iter_mut() {
+                    track.mute = !mute_all && channel != self.focused_channel;
+                }
+            }
+
+            // Section controls.
+            (UiState::EditSection, Event::Key(Key::Char('<'))) => {
+                self.focused_section =
+                    (self.focused_section + 1 + self.sections.len()) % self.sections.len();
+            }
+            (UiState::EditSection, Event::Key(Key::Char('>'))) => {
+                self.focused_section = (self.focused_section + 1) % self.sections.len();
+            }
+            (UiState::EditSection, Event::Key(Key::Char('Z'))) => {
+                self.sections.push(Section {
+                    tracks: [[None; 128]; 16],
+                });
+                self.focused_section = self.sections.len() - 1;
+            }
+
+            (UiState::EditSection, Event::Key(Key::Char(ch @ '0'..='9'))) => {
+                let index_to_focus = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0']
+                    .iter()
+                    .position(|other| other == ch)
+                    .unwrap();
+                if let Some((note, track)) = section
+                    .iter_channel_mut(self.focused_channel)
+                    .skip(index_to_focus)
+                    .next()
+                {
+                    self.focused_note = note;
+                    self.focused_step = self.focused_step.min(track.steps.len() - 1);
+                    let step = &mut track.steps[self.focused_step];
+                    *step = match *step {
+                        Step::Off => Step::On,
+                        Step::On => Step::Off,
+                        _ => *step,
+                    };
+                    self.focused_step = (self.focused_step + 1) % track.steps.len();
+                }
+            }
+
+            (UiState::EditSection, Event::Key(Key::Delete)) => {
+                let track = section.tracks[self.focused_channel][self.focused_note].take();
+                if track.is_some() {
+                    let next_track = section
+                        .iter()
+                        .skip_while(|&(channel, note, _)| {
+                            channel != focused_channel || note != focused_note
+                        })
+                        .skip(1)
+                        .chain(section.iter().take_while(|&(channel, note, _)| {
+                            channel != focused_channel || note != focused_note
+                        }))
+                        .next();
+                    if let Some((channel, note, _)) = next_track {
+                        self.focused_channel = channel;
+                        self.focused_note = note;
+                    }
+                }
+            }
+
+            (UiState::EditSection, Event::Key(Key::Char('h'))) => {
+                if let Some(track) = section.tracks[self.focused_channel][self.focused_note] {
+                    self.focused_step = self
+                        .focused_step
+                        .checked_sub(1)
+                        .unwrap_or(track.steps.len() - 1);
+                }
+            }
+            (UiState::EditSection, Event::Key(Key::Char('l'))) => {
+                if let Some(track) = section.tracks[self.focused_channel][self.focused_note] {
+                    self.focused_step = (self.focused_step + 1) % track.steps.len();
+                }
+            }
+
+            (UiState::EditSection, Event::Key(Key::Char('k'))) => {
+                let previous_track = section
+                    .iter()
+                    .rev()
+                    .skip_while(|&(channel, note, _)| {
+                        channel != focused_channel || note != focused_note
+                    })
+                    .skip(1)
+                    .next();
+                if let Some((channel, note, _)) = previous_track {
+                    self.focused_channel = channel;
+                    self.focused_note = note;
+                };
+            }
+            (UiState::EditSection, Event::Key(Key::Char('j'))) => {
+                let next_track = section
+                    .iter()
+                    .skip_while(|&(channel, note, _)| {
+                        channel != focused_channel || note != focused_note
+                    })
+                    .skip(1)
+                    .next();
+                if let Some((channel, note, _)) = next_track {
+                    self.focused_channel = channel;
+                    self.focused_note = note;
+                };
+            }
+
+            (UiState::EditSection, Event::Key(Key::Char('g'))) => {
+                let first_track = section.iter().next();
+                if let Some((channel, note, _)) = first_track {
+                    self.focused_channel = channel;
+                    self.focused_note = note;
+                };
+            }
+            (UiState::EditSection, Event::Key(Key::Char('G'))) => {
+                let last_track = section.iter().last();
+                if let Some((channel, note, _)) = last_track {
+                    self.focused_channel = channel;
+                    self.focused_note = note;
+                };
+            }
+
+            (UiState::EditSection, Event::Key(Key::Char('.'))) => {
+                if let Some(track) = &mut section.tracks[self.focused_channel][self.focused_note] {
+                    track.steps[self.focused_step] = match track.steps[self.focused_step] {
+                        Step::On => Step::Off,
+                        _ => Step::On,
+                    };
+                    self.focused_step = (self.focused_step + 1) % track.steps.len();
+                }
+            }
+
+            (UiState::EditSection, Event::Key(Key::Char('-'))) => {
+                if let Some(track) = &mut section.tracks[self.focused_channel][self.focused_note] {
+                    track.steps[self.focused_step] = match track.steps[self.focused_step] {
+                        Step::Hold => Step::Off,
+                        _ => Step::Hold,
+                    };
+                    self.focused_step = (self.focused_step + 1) % track.steps.len();
+                }
+            }
+
+            (UiState::EditSection, Event::Key(Key::Char('K'))) => {
+                self.state = UiState::ConstrainToKey(KeyField::new())
+            }
+            (UiState::ConstrainToKey(field), event) => match field.update(event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(music::Key {
+                    tonic,
+                    accidental,
+                    mode,
+                    octave,
+                }) => {
+                    // Compute ten notes from the key.
+                    let degree = match tonic {
+                        ch @ 'c'..='g' => ch as i32 - 'c' as i32,
+                        ch @ 'a'..='b' => ch as i32 - 'a' as i32 + 'g' as i32 - 'c' as i32,
+                        _ => unreachable!(),
+                    };
+                    let root = Mode::Major.semitones(degree as u8);
+                    let accidental = match accidental {
+                        Some(Accidental::Flat) => -1,
+                        Some(Accidental::Sharp) => 1,
+                        _ => 0,
+                    };
+                    let notes = mode
+                        .intervals()
+                        .map(|interval| {
+                            (12 * octave as i32 + root as i32 + accidental + interval as i32)
+                                as usize
+                        })
+                        .take(10);
+
+                    // Clone the channel's tracks and form an iterator over them.
+                    let cloned_tracks = section.tracks[self.focused_channel].clone();
+                    let tracks = cloned_tracks
+                        .iter()
+                        .copied()
+                        .filter_map(|track| track)
+                        .chain(repeat(Track {
+                            mute: false,
+                            steps: [Step::Off; 16],
+                        }));
+
+                    // Zero out the channel's tracks and populate for each note.
+                    section.tracks[self.focused_channel] = [None; 128];
+                    for (note, track) in notes.zip(tracks) {
+                        section.tracks[self.focused_channel][note] = Some(track);
+                    }
+
+                    let (note, _) = section.iter_channel(self.focused_channel).last().unwrap();
+                    self.focused_note = note;
+                    self.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.state = UiState::EditSection;
+                }
+            },
+
+            (UiState::EditSection, Event::Key(Key::Char('b'))) => {
+                self.state = UiState::EditBpm(UnsignedField::new(10, 300))
+            }
+            (UiState::EditBpm(field), event) => match field.update(event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(bpm) => {
+                    self.bpm = bpm;
+                    self.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.state = UiState::EditSection;
+                }
+            },
+
+            (UiState::EditSection, Event::Key(Key::Char('s'))) => {
                 self.state = UiState::EditSwing(UnsignedField::new(10, 9))
             }
-            (UiState::EditSwing(acc), event) => match acc.update(event) {
+            (UiState::EditSwing(field), event) => match field.update(event) {
                 FieldUpdateResult::NotReady => (),
                 FieldUpdateResult::Ready(swing) => {
                     self.swing = swing;
-                    self.state = UiState::EditSong;
+                    self.state = UiState::EditSection;
                 }
                 FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSong;
+                    self.state = UiState::EditSection;
                 }
             },
             _ => (),
         };
         true
     }
-    fn render_to_backend(&self) -> Result<(), SendError<midi::Song>> {
+    fn render_to_backend(&self) -> Result<(), SendError<backend::Song>> {
         let backend = match &self.backend {
             Some(backend) => backend,
             None => return Ok(()),
         };
-        let events =
-            {
-                let percussion = self.song.percussion.tracks.iter().flat_map(
-                    |PercussionTrack { note, steps }| {
-                        steps.iter().enumerate().filter(|(_, &step)| step.on).map(
-                            move |(index, _)| midi::Event {
-                                time: index as f64 / steps.len() as f64,
-                                channel: 9,
-                                fields: EventFields::Note {
-                                    note: *note,
-                                    velocity: 127,
-                                    duration: 0.5 / steps.len() as f64,
-                                    chance_to_fire: 1.0,
-                                },
-                            },
-                        )
-                    },
-                );
-                let melody =
-                    self.song
-                        .melody
-                        .tracks
-                        .iter()
-                        .flat_map(|MelodyTrack { channel, steps }| {
-                            steps
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(index, &step)| match step {
-                                    MelodyStep::On { degree } => Some((index, degree)),
-                                    _ => None,
-                                })
-                                .map(move |(index, degree)| {
-                                    let music::Key {
-                                        tonic,
-                                        accidental,
-                                        mode,
-                                    } = &self.song.melody.key;
-                                    let tonic = match *tonic {
-                                        ch @ 'c'..='g' => ch as i32 - 'c' as i32,
-                                        ch @ 'a'..='b' => {
-                                            ch as i32 - 'a' as i32 + 'g' as i32 - 'c' as i32
+        let sections =
+            self.sections
+                .iter()
+                .map(|section| {
+                    let mut events: Vec<_> =
+                        section
+                            .iter()
+                            .filter(|(_, _, track)| !track.mute)
+                            .flat_map(move |(channel, note, track)| {
+                                track.steps.iter().enumerate().filter_map(
+                                    move |(step_index, step)| match step {
+                                        Step::Hold | Step::Off => None,
+                                        Step::On => {
+                                            let steps_to_hold = 1 + track
+                                                .steps
+                                                .iter()
+                                                .cycle()
+                                                .skip(step_index + 1)
+                                                .take_while(|step| match step {
+                                                    Step::Hold => true,
+                                                    _ => false,
+                                                })
+                                                .count();
+                                            Some(backend::Event {
+                                                time: step_index as f64 / track.steps.len() as f64,
+                                                channel: channel as u8,
+                                                fields: EventFields::Note {
+                                                    note: note as u8,
+                                                    velocity: 127,
+                                                    duration: (steps_to_hold as f64 - 0.5)
+                                                        / track.steps.len() as f64,
+                                                    chance_to_fire: 1.0,
+                                                },
+                                            })
                                         }
-                                        _ => unreachable!(),
-                                    } + match accidental {
-                                        Some(Accidental::Flat) => -1,
-                                        Some(Accidental::Sharp) => 1,
-                                        None => 0,
-                                    };
-                                    let octave = 4;
-                                    let note =
-                                        (12 * octave + tonic + mode.semitones(degree as u8) as i32)
-                                            as u8;
-
-                                    // Next, measure the hold time.
-                                    let steps_to_hold_for = steps
-                                        .iter()
-                                        .cycle()
-                                        .enumerate()
-                                        .skip(index + 1)
-                                        .filter(|(_, step)| match step {
-                                            MelodyStep::Hold => false,
-                                            _ => true,
-                                        })
-                                        .map(|(index, _)| index)
-                                        .next()
-                                        .unwrap()
-                                        - index;
-
-                                    midi::Event {
-                                        time: index as f64 / steps.len() as f64,
-                                        channel: *channel,
-                                        fields: EventFields::Note {
-                                            note,
-                                            velocity: 127,
-                                            duration: (steps_to_hold_for as f64 - 0.5)
-                                                / steps.len() as f64,
-                                            chance_to_fire: 1.0,
-                                        },
-                                    }
-                                })
-                        });
-                let mut events: Vec<_> = percussion.chain(melody).collect();
-                events.sort_unstable();
-                events
-            };
-        let sections = vec![Section {
-            next_section: None,
-            events,
-        }];
-        backend.channels().song_tx.send(midi::Song {
-            bpm: if self.paused { 0 } else { self.bpm },
-            swing: self.swing as f64 / 9.0,
+                                    },
+                                )
+                            })
+                            .collect();
+                    events.sort_unstable();
+                    backend::Section {
+                        bpm: self.bpm,
+                        swing: self.swing as f64 / 9.0,
+                        events,
+                    }
+                })
+                .collect();
+        backend.channels().song_tx.send(Song {
+            paused: self.paused,
+            programs: self.programs,
             sections,
         })?;
         Ok(())
     }
     fn write(&self, writer: &mut impl Write, width: u16, height: u16) -> std::io::Result<()> {
-        write!(writer, "{}", cursor::Goto(1, 1))?;
-
-        // Percussion.
-        let percussion = &self.song.percussion;
-        let percussion_is_focused = match (&self.state, &self.song.state) {
-            (UiState::EditSong, SongState::EditPercussion) => true,
-            _ => false,
-        };
-        for (track_index, track) in percussion.tracks.iter().enumerate() {
-            let note = match (percussion_is_focused, &percussion.state) {
-                (true, PercussionState::EditNote(UnsignedField { acc, .. }))
-                    if percussion.focused_track == track_index =>
-                {
-                    write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Red),
-                        color::Fg(color::Black)
-                    )?;
-                    *acc
-                }
-                _ => {
-                    write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Reset),
-                        color::Fg(color::Reset)
-                    )?;
-                    track.note as u32
-                }
-            };
-            write!(writer, "{:3}", note)?;
-
-            let active_step = (self.clock * track.steps.len() as f64) as usize;
-            for (step_index, step) in track.steps.iter().enumerate() {
-                match (
-                    percussion_is_focused,
-                    percussion.focused_track == track_index,
-                    percussion.focused_step == step_index,
-                ) {
-                    (true, true, true) => write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Red),
-                        color::Fg(color::Black)
-                    ),
-                    (true, true, false) => write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Blue),
-                        color::Fg(color::Black)
-                    ),
-                    _ => write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Reset),
-                        color::Fg(color::Reset)
-                    ),
-                }?;
-                let ch = match (step.on, active_step == step_index) {
-                    (true, true) => '*',
-                    (true, false) => '.',
-                    _ => ' ',
-                };
-                write!(writer, " {}", ch)?;
-            }
-            write!(writer, "\r\n")?;
-        }
-
-        // Melody.
-        let melody = &self.song.melody;
-        let melody_is_focused = match (&self.state, &self.song.state) {
-            (UiState::EditSong, SongState::EditMelody) => true,
-            _ => false,
-        };
-        for (track_index, track) in melody.tracks.iter().enumerate() {
-            let channel = match (melody_is_focused, &melody.state) {
-                (true, MelodyState::EditChannel(UnsignedField { acc, .. }))
-                    if melody.focused_track == track_index =>
-                {
-                    write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Red),
-                        color::Fg(color::Black)
-                    )?;
-                    *acc
-                }
-                _ => {
-                    write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Reset),
-                        color::Fg(color::Reset)
-                    )?;
-                    track.channel as u32
-                }
-            };
-            write!(writer, "{:3}", channel)?;
-
-            let active_step = (self.clock * track.steps.len() as f64) as usize;
-            for (step_index, step) in track.steps.iter().enumerate() {
-                match (
-                    melody_is_focused,
-                    melody.focused_track == track_index,
-                    melody.focused_step == step_index,
-                ) {
-                    (true, true, true) => write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Red),
-                        color::Fg(color::Black)
-                    ),
-                    (true, true, false) => write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Blue),
-                        color::Fg(color::Black)
-                    ),
-                    _ => write!(
-                        writer,
-                        "{}{}",
-                        color::Bg(color::Reset),
-                        color::Fg(color::Reset)
-                    ),
-                }?;
-                match step {
-                    MelodyStep::On { degree } => write!(writer, " {}", degree)?,
-                    MelodyStep::Hold => write!(writer, " -")?,
-                    MelodyStep::Off => write!(writer, " .")?,
-                };
-            }
-            write!(writer, "\r\n")?;
-        }
+        let PlaybackState { clock, section } = self.playback_state;
         write!(
             writer,
-            "{}{}{} {} {:.2}",
-            color::Fg(color::Reset),
-            color::Bg(color::Reset),
-            cursor::Goto(width / 2, height / 2),
+            "{}{}{} clock={:.2} section={} {} {} {} ",
+            cursor::Goto(1, 1),
+            clear::CurrentLine,
             if self.paused { "||" } else { " >" },
-            self.clock,
+            clock,
+            section,
+            self.focused_section,
+            self.focused_channel,
+            self.focused_note,
         )?;
-        let bpm = if let UiState::EditBpm(UnsignedField { acc, .. }) = self.state {
-            write!(
-                writer,
-                "{}{}",
-                color::Fg(color::Black),
-                color::Bg(color::Red)
-            )?;
-            acc
-        } else {
-            self.bpm
-        };
-        write!(
-            writer,
-            " bpm={:3}{}{}",
-            bpm,
-            color::Fg(color::Reset),
-            color::Bg(color::Reset),
-        )?;
-        let swing = if let UiState::EditSwing(UnsignedField { acc, .. }) = self.state {
-            write!(
-                writer,
-                "{}{}",
-                color::Fg(color::Black),
-                color::Bg(color::Red)
-            )?;
-            acc
-        } else {
-            self.swing
-        };
-        write!(
-            writer,
-            " swing={}{}{}",
-            swing,
-            color::Fg(color::Reset),
-            color::Bg(color::Reset),
-        )?;
-        write!(writer, " key=")?;
-        match &self.song.melody.state {
-            MelodyState::EditKey(acc) => {
+
+        match &self.state {
+            UiState::EditBpm(field) => {
                 write!(
                     writer,
-                    "{}{}",
-                    color::Fg(color::Black),
+                    "bpm={}{}{:2}{}{}",
                     color::Bg(color::Red),
+                    color::Fg(color::Black),
+                    field.acc,
+                    color::Bg(color::Reset),
+                    color::Fg(color::Reset)
                 )?;
-                let &KeyField {
-                    tonic,
-                    accidental,
-                    mode,
-                } = acc;
+            }
+            UiState::EditSwing(field) => {
+                write!(
+                    writer,
+                    "swing={}{}{:2}{}{}",
+                    color::Bg(color::Red),
+                    color::Fg(color::Black),
+                    field.acc,
+                    color::Bg(color::Reset),
+                    color::Fg(color::Reset)
+                )?;
+            }
+            UiState::AddChannel(field) => {
+                write!(
+                    writer,
+                    "add channel={}{}{:2}{}{}",
+                    color::Bg(color::Red),
+                    color::Fg(color::Black),
+                    field.acc,
+                    color::Bg(color::Reset),
+                    color::Fg(color::Reset)
+                )?;
+            }
+            UiState::EditChannel(field) => {
+                write!(
+                    writer,
+                    "edit channel={}{}{:2}{}{}",
+                    color::Bg(color::Red),
+                    color::Fg(color::Black),
+                    field.acc,
+                    color::Bg(color::Reset),
+                    color::Fg(color::Reset)
+                )?;
+            }
+            UiState::AddNote(field) => {
+                write!(
+                    writer,
+                    "add note={}{}{:3}{}{}",
+                    color::Bg(color::Red),
+                    color::Fg(color::Black),
+                    field.acc,
+                    color::Bg(color::Reset),
+                    color::Fg(color::Reset)
+                )?;
+            }
+            UiState::EditNote(field) => {
+                write!(
+                    writer,
+                    "edit note={}{}{:3}{}{}",
+                    color::Bg(color::Red),
+                    color::Fg(color::Black),
+                    field.acc,
+                    color::Bg(color::Reset),
+                    color::Fg(color::Reset)
+                )?;
+            }
+            UiState::EditProgram(field) => {
+                write!(
+                    writer,
+                    "program={}{}{:3}{}{}",
+                    color::Bg(color::Red),
+                    color::Fg(color::Black),
+                    field.acc,
+                    color::Bg(color::Reset),
+                    color::Fg(color::Reset)
+                )?;
+            }
+            UiState::ConstrainToKey(KeyField {
+                tonic,
+                accidental,
+                mode,
+                octave,
+            }) => {
+                write!(
+                    writer,
+                    "key={}{}",
+                    color::Bg(color::Red),
+                    color::Fg(color::Black),
+                )?;
+                let spaces = if let Some(_) = tonic { 1 } else { 0 }
+                    + if let Some(_) = accidental { 1 } else { 0 }
+                    + if let Mode::Minor = mode { 1 } else { 0 }
+                    + if let Some(_) = octave { 1 } else { 0 };
+                for _ in 0..4 - spaces {
+                    write!(writer, " ")?;
+                }
                 if let Some(tonic) = tonic {
-                    let key = music::Key {
-                        tonic,
-                        accidental,
-                        mode,
-                    };
-                    write!(writer, "{}", key)?;
-                } else {
-                    write!(writer, "   ")?;
+                    write!(writer, "{}", tonic)?;
+                }
+                match accidental {
+                    Some(Accidental::Flat) => write!(writer, "b")?,
+                    Some(Accidental::Sharp) => write!(writer, "#")?,
+                    None => (),
+                };
+                match mode {
+                    Mode::Major => (),
+                    Mode::Minor => write!(writer, "m")?,
+                };
+                if let Some(octave) = octave {
+                    write!(writer, "{}", octave)?;
                 }
                 write!(
                     writer,
                     "{}{}",
-                    color::Fg(color::Reset),
                     color::Bg(color::Reset),
+                    color::Fg(color::Reset)
                 )?;
             }
-            _ => {
-                write!(writer, "{}", self.song.melody.key)?;
+            UiState::Err(err) => {
+                write!(writer, "{}", err)?;
             }
+            _ => (),
         };
-        if let UiState::Err(err) = &self.state {
-            write!(writer, "{}{}", cursor::Goto(width / 2, height / 2 + 1), err)?;
+        write!(writer, "\r\n\r\n")?;
+
+        let section = &self.sections[self.focused_section];
+        let mut last_channel = None;
+        for (channel, note, track) in section.iter() {
+            if last_channel != Some(channel) {
+                write!(writer, "{:2} {:3}", channel, note)?;
+                last_channel = Some(channel);
+            } else {
+                write!(writer, "   {:3}", note)?;
+            }
+            let mute = if track.mute { 'm' } else { ' ' };
+            write!(writer, " {}", mute)?;
+            let active_step = (clock * track.steps.len() as f64) as usize;
+            for (step_index, step) in track.steps.iter().enumerate() {
+                let ch = match step {
+                    Step::Hold => '-',
+                    Step::Off => ' ',
+                    Step::On
+                        if self.focused_section == self.playback_state.section
+                            && !track.mute
+                            && step_index == active_step =>
+                    {
+                        '*'
+                    }
+                    Step::On => '.',
+                };
+                match (
+                    channel == self.focused_channel && note == self.focused_note,
+                    step_index == self.focused_step,
+                ) {
+                    (true, true) => write!(
+                        writer,
+                        "{}{} {}{}{}",
+                        color::Bg(color::Red),
+                        color::Fg(color::Black),
+                        ch,
+                        color::Bg(color::Reset),
+                        color::Fg(color::Reset)
+                    )?,
+                    (true, false) => write!(
+                        writer,
+                        "{}{} {}{}{}",
+                        color::Bg(color::Blue),
+                        color::Fg(color::Black),
+                        ch,
+                        color::Bg(color::Reset),
+                        color::Fg(color::Reset)
+                    )?,
+                    _ => write!(writer, " {}", ch)?,
+                };
+            }
+            write!(writer, "\r\n")?;
         }
         writer.flush()?;
         Ok(())
@@ -889,35 +977,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     });
     let mut ui = Ui {
-        paused: true,
         bpm: 60,
         swing: 0,
 
-        clock: 0.0,
+        paused: true,
+        playback_state: PlaybackState::default(),
         backend: Some(Box::new(backend)),
 
-        state: UiState::EditSong,
-
-        song: Song {
-            state: SongState::EditPercussion,
-            percussion: Percussion {
-                state: PercussionState::EditSteps,
-                tracks: Vec::new(),
-                focused_track: 0,
-                focused_step: 0,
-            },
-            melody: Melody {
-                state: MelodyState::EditSteps,
-                tracks: Vec::new(),
-                focused_track: 0,
-                focused_step: 0,
-                key: music::Key {
-                    tonic: 'c',
-                    accidental: None,
-                    mode: Mode::Major,
-                },
-            },
-        },
+        state: UiState::EditSection,
+        programs: [0; 16],
+        sections: vec![Section {
+            tracks: [[None; 128]; 16],
+        }],
+        focused_section: 0,
+        focused_channel: 0,
+        focused_note: 0,
+        focused_step: 0,
     };
     let (mut width, mut height) = termion::terminal_size()?;
     while ui.step(&event_rx, &error_rx) {

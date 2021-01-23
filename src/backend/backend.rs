@@ -1,6 +1,5 @@
 use crossbeam::{Receiver, Sender};
 use std::cmp::Ordering;
-use std::error::Error;
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum EventFields {
@@ -50,11 +49,13 @@ pub struct PlaybackState {
     pub section: usize,
 }
 
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
 pub struct BackendChannels {
     pub song_tx: Sender<Song>,
     pub quit_tx: Sender<()>,
     pub playback_state_rx: Receiver<PlaybackState>,
-    pub fatal_rx: Receiver<Box<dyn Error + Send + Sync>>,
+    pub fatal_rx: Receiver<Error>,
 }
 
 pub trait Backend {

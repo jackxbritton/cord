@@ -1,11 +1,10 @@
 use crate::backend;
 
-use backend::backend::{Backend, BackendChannels, Event, EventFields, Song};
+use backend::backend::{Backend, BackendChannels, Error, Event, EventFields, Song};
 use crossbeam::{Receiver, Sender, TrySendError};
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::default::Default;
-use std::error::Error;
 use std::f64::consts::PI;
 use std::ops::Range;
 
@@ -237,8 +236,7 @@ impl<N, P> JackBackend<N, P> {
         let (quit_tx, quit_rx) = crossbeam::unbounded();
         let mut quit = false;
         let (playback_state_tx, playback_state_rx) = crossbeam::bounded(256);
-        let (fatal_tx, fatal_rx): (Sender<Box<dyn Error + Send + Sync>>, Receiver<_>) =
-            crossbeam::bounded(1);
+        let (fatal_tx, fatal_rx): (Sender<Error>, Receiver<_>) = crossbeam::bounded(1);
 
         let (client, _) = jack::Client::new(
             "cord",

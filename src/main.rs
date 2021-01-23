@@ -7,7 +7,6 @@ use music::*;
 
 use crossbeam::select;
 use crossbeam::{Receiver, SendError, Sender};
-use std::error::Error;
 use std::io::{stdin, stdout, Write};
 use std::iter::repeat;
 use std::thread::{sleep, spawn};
@@ -19,9 +18,8 @@ use termion::raw::IntoRawMode;
 use termion::screen::AlternateScreen;
 use termion::{clear, color, cursor};
 
-// TODO(jack)
-// sections
-// undo / redo
+// TODO
+// * highlighting - 'V'
 
 enum FieldUpdateResult<T> {
     Ready(T),
@@ -33,6 +31,7 @@ trait Field<T> {
     fn update(&mut self, event: &Event) -> FieldUpdateResult<T>;
 }
 
+#[derive(Copy, Clone)]
 struct UnsignedField {
     radix: u32,
     max: u32,
@@ -177,6 +176,7 @@ impl Field<music::Key> for KeyField {
     }
 }
 
+#[derive(Clone)]
 enum UiState {
     EditSection,
 
@@ -191,21 +191,27 @@ enum UiState {
     EditSwing(UnsignedField),
     EditProgram(UnsignedField),
 
-    Err(Box<dyn Error>),
+    EditChanceToFire(UnsignedField),
+
+    Err(String),
 }
 
 #[derive(Copy, Clone)]
 enum Step {
     Hold,
     Off,
-    On,
+    On { chance_to_fire: u8 },
 }
+
+const NUM_STEPS: usize = 16;
+
 #[derive(Copy, Clone)]
 struct Track {
-    steps: [Step; 16],
+    steps: [Step; NUM_STEPS],
     mute: bool,
 }
 
+#[derive(Clone)]
 struct Section {
     tracks: [[Option<Track>; 128]; 16],
 }
@@ -221,470 +227,85 @@ impl Section {
                 })
             })
     }
-    fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (usize, usize, &mut Track)> {
-        self.tracks
-            .iter_mut()
-            .enumerate()
-            .flat_map(move |(channel, tracks)| {
-                tracks
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(move |(note, track)| {
-                        track.as_mut().map(|track| (channel, note, track))
-                    })
-            })
-    }
-    fn iter_channel(&self, channel: usize) -> impl DoubleEndedIterator<Item = (usize, &Track)> {
-        self.tracks[channel]
-            .iter()
-            .enumerate()
-            .filter_map(move |(note, track)| track.as_ref().map(|track| (note, track)))
-    }
-    fn iter_channel_mut(
-        &mut self,
-        channel: usize,
-    ) -> impl DoubleEndedIterator<Item = (usize, &mut Track)> {
-        self.tracks[channel]
-            .iter_mut()
-            .enumerate()
-            .filter_map(move |(note, track)| track.as_mut().map(|track| (note, track)))
-    }
 }
 
-struct Ui {
+#[derive(Clone)]
+struct Song {
     bpm: u32,
     swing: u32,
-
-    paused: bool,
-    playback_state: backend::PlaybackState,
-    backend: Option<Box<dyn Backend>>,
 
     state: UiState,
     sections: Vec<Section>,
     programs: [u8; 16],
     focused_section: usize,
-    focused_channel: usize,
-    focused_note: usize,
+    focused_row: usize,
     focused_step: usize,
 }
 
+struct Ui {
+    event_rx: Receiver<Event>,
+    error_rx: Receiver<Error>,
+
+    paused: bool,
+
+    playback_state: backend::PlaybackState,
+    backend: Option<Box<dyn Backend>>,
+
+    undo: Vec<Song>,
+    redo: Vec<Song>,
+
+    song: Song,
+}
+
 impl Ui {
-    fn step(
-        &mut self,
-        event_rx: &Receiver<Event>,
-        error_rx: &Receiver<Box<dyn Error + Send>>,
-    ) -> bool {
-        match self.step_helper(event_rx, error_rx) {
-            Ok(quit) => quit,
+    fn step(&mut self) -> bool {
+        match self.step_helper() {
+            Ok(true) => {
+                if let Some(backend) = &self.backend {
+                    let BackendChannels { quit_tx, .. } = backend.channels();
+                    quit_tx.send(()).ok();
+                };
+                true
+            }
+            Ok(false) => false,
             Err(err) => {
-                self.state = UiState::Err(err);
+                self.song.state = UiState::Err(err.to_string());
                 false
             }
         }
     }
-    fn step_helper(
-        &mut self,
-        event_rx: &Receiver<Event>,
-        error_rx: &Receiver<Box<dyn Error + Send>>,
-    ) -> Result<bool, Box<dyn Error>> {
-        let nevers = (crossbeam::channel::never(), crossbeam::channel::never());
-        let (playback_state_rx, fatal_rx) = if let Some(backend) = &self.backend {
-            (
-                &backend.channels().playback_state_rx,
-                &backend.channels().fatal_rx,
-            )
+    fn step_helper(&mut self) -> Result<bool, Error> {
+        if let Some(backend) = &self.backend {
+            let BackendChannels {
+                playback_state_rx,
+                fatal_rx,
+                ..
+            } = backend.channels();
+            select! {
+                recv(self.event_rx) -> event => {
+                    if !self.handle_input(event?) {
+                        return Ok(false);
+                    }
+                    self.render_to_backend()?;
+                },
+                recv(self.error_rx) -> err => return Err(err?),
+                recv(playback_state_rx) -> playback_state => self.playback_state = playback_state?,
+                recv(fatal_rx) -> err => {
+                    self.backend = None;
+                    return Err(err?);
+                },
+            };
         } else {
-            (&nevers.0, &nevers.1)
-        };
-        select! {
-            recv(event_rx) -> event => {
-                if !self.handle_input(event?) {
-                    if let Some(backend) = &self.backend {
-                        backend.channels().quit_tx.send(()).ok();
+            select! {
+                recv(self.event_rx) -> event => {
+                    if !self.handle_input(event?) {
+                        return Ok(false);
                     }
-                    return Ok(false);
-                }
-
-                self.render_to_backend()?;
-            },
-            recv(error_rx) -> err => return Err(err?),
-            recv(playback_state_rx) -> playback_state => self.playback_state = playback_state?,
-            recv(fatal_rx) -> err => {
-                self.backend = None;
-                return Err(err?);
-            },
-        };
+                },
+                recv(self.error_rx) -> err => return Err(err?),
+            };
+        }
         Ok(true)
-    }
-    fn handle_input(&mut self, event: Event) -> bool {
-        let section = &mut self.sections[self.focused_section];
-        let (focused_channel, focused_note) = (self.focused_channel, self.focused_note);
-        match (&mut self.state, &event) {
-            (_, Event::Key(Key::Ctrl('c'))) => return false,
-            (_, Event::Key(Key::Char(' '))) => self.paused = !self.paused,
-
-            (UiState::EditSection, Event::Key(Key::Char('C'))) => {
-                self.state = UiState::AddChannel(UnsignedField::new(10, 15))
-            }
-            (UiState::AddChannel(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(channel) => {
-                    self.focused_channel = channel as usize;
-                    let first_track = section.iter_channel(self.focused_channel).next();
-                    self.focused_note = if let Some((note, _)) = first_track {
-                        note
-                    } else {
-                        section.tracks[self.focused_channel][0] = Some(Track {
-                            mute: false,
-                            steps: [Step::Off; 16],
-                        });
-                        0
-                    };
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-
-            (UiState::EditSection, Event::Key(Key::Char('c'))) => {
-                if let Some(_) = self.sections[self.focused_section].tracks[self.focused_channel]
-                    [self.focused_note]
-                {
-                    self.state = UiState::EditChannel(UnsignedField::new(10, 15));
-                }
-            }
-            (UiState::EditChannel(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(channel) => {
-                    let new_channel = channel as usize;
-                    section.tracks[new_channel] = section.tracks[self.focused_channel];
-                    section.tracks[self.focused_channel] = [None; 128];
-                    self.focused_channel = new_channel;
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-
-            (UiState::EditSection, Event::Key(Key::Char('N'))) => {
-                if section.iter_channel(self.focused_channel).next().is_some() {
-                    self.state = UiState::AddNote(UnsignedField::new(10, 127))
-                }
-            }
-            (UiState::AddNote(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(note) => {
-                    self.focused_note = note as usize;
-                    if self.sections[self.focused_section].tracks[self.focused_channel]
-                        [self.focused_note]
-                        .is_none()
-                    {
-                        self.sections[self.focused_section].tracks[self.focused_channel]
-                            [self.focused_note] = Some(Track {
-                            mute: false,
-                            steps: [Step::Off; 16],
-                        });
-                    }
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-
-            (UiState::EditSection, Event::Key(Key::Char('n'))) => {
-                if let Some(_) = section.tracks[self.focused_channel][self.focused_note] {
-                    self.state = UiState::EditNote(UnsignedField::new(10, 127))
-                }
-            }
-            (UiState::EditNote(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(note) => {
-                    let new_note = note as usize;
-                    section.tracks[self.focused_channel][new_note] =
-                        section.tracks[self.focused_channel][self.focused_note].take();
-                    self.focused_note = new_note;
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-
-            (UiState::EditSection, Event::Key(Key::Char('p'))) => {
-                self.state = UiState::EditProgram(UnsignedField::new(10, 127));
-            }
-            (UiState::EditProgram(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(program) => {
-                    self.programs[self.focused_channel as usize] = program as u8;
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-
-            // Mute / solo track / channel.
-            (UiState::EditSection, Event::Key(Key::Char('m'))) => {
-                if let Some(track) = &mut section.tracks[self.focused_channel][self.focused_note] {
-                    track.mute = !track.mute;
-                }
-            }
-            (UiState::EditSection, Event::Key(Key::Char('M'))) => {
-                let mute = section
-                    .iter_channel(self.focused_channel)
-                    .any(|(_, track)| !track.mute);
-                for (_, track) in section.iter_channel_mut(self.focused_channel) {
-                    track.mute = mute;
-                }
-            }
-            (UiState::EditSection, Event::Key(Key::Char('s'))) => {
-                if section
-                    .iter_channel(self.focused_channel)
-                    .all(|(note, track)| track.mute == (note != focused_note))
-                {
-                    for (_, track) in section.iter_channel_mut(self.focused_channel) {
-                        track.mute = false;
-                    }
-                } else {
-                    for (note, track) in section.iter_channel_mut(self.focused_channel) {
-                        track.mute = note != self.focused_note;
-                    }
-                }
-            }
-            (UiState::EditSection, Event::Key(Key::Char('S'))) => {
-                let mute_all = section
-                    .iter()
-                    .all(|(channel, _, track)| track.mute == (channel != focused_channel));
-                for (channel, _, track) in section.iter_mut() {
-                    track.mute = !mute_all && channel != self.focused_channel;
-                }
-            }
-
-            // Section controls.
-            (UiState::EditSection, Event::Key(Key::Char('<'))) => {
-                self.focused_section =
-                    (self.focused_section + 1 + self.sections.len()) % self.sections.len();
-            }
-            (UiState::EditSection, Event::Key(Key::Char('>'))) => {
-                self.focused_section = (self.focused_section + 1) % self.sections.len();
-            }
-            (UiState::EditSection, Event::Key(Key::Char('Z'))) => {
-                self.sections.push(Section {
-                    tracks: [[None; 128]; 16],
-                });
-                self.focused_section = self.sections.len() - 1;
-            }
-
-            (UiState::EditSection, Event::Key(Key::Char(ch @ '0'..='9'))) => {
-                let index_to_focus = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0']
-                    .iter()
-                    .position(|other| other == ch)
-                    .unwrap();
-                if let Some((note, track)) = section
-                    .iter_channel_mut(self.focused_channel)
-                    .skip(index_to_focus)
-                    .next()
-                {
-                    self.focused_note = note;
-                    self.focused_step = self.focused_step.min(track.steps.len() - 1);
-                    let step = &mut track.steps[self.focused_step];
-                    *step = match *step {
-                        Step::Off => Step::On,
-                        Step::On => Step::Off,
-                        _ => *step,
-                    };
-                    self.focused_step = (self.focused_step + 1) % track.steps.len();
-                }
-            }
-
-            (UiState::EditSection, Event::Key(Key::Delete)) => {
-                let track = section.tracks[self.focused_channel][self.focused_note].take();
-                if track.is_some() {
-                    let next_track = section
-                        .iter()
-                        .skip_while(|&(channel, note, _)| {
-                            channel != focused_channel || note != focused_note
-                        })
-                        .skip(1)
-                        .chain(section.iter().take_while(|&(channel, note, _)| {
-                            channel != focused_channel || note != focused_note
-                        }))
-                        .next();
-                    if let Some((channel, note, _)) = next_track {
-                        self.focused_channel = channel;
-                        self.focused_note = note;
-                    }
-                }
-            }
-
-            (UiState::EditSection, Event::Key(Key::Char('h'))) => {
-                if let Some(track) = section.tracks[self.focused_channel][self.focused_note] {
-                    self.focused_step = self
-                        .focused_step
-                        .checked_sub(1)
-                        .unwrap_or(track.steps.len() - 1);
-                }
-            }
-            (UiState::EditSection, Event::Key(Key::Char('l'))) => {
-                if let Some(track) = section.tracks[self.focused_channel][self.focused_note] {
-                    self.focused_step = (self.focused_step + 1) % track.steps.len();
-                }
-            }
-
-            (UiState::EditSection, Event::Key(Key::Char('k'))) => {
-                let previous_track = section
-                    .iter()
-                    .rev()
-                    .skip_while(|&(channel, note, _)| {
-                        channel != focused_channel || note != focused_note
-                    })
-                    .skip(1)
-                    .next();
-                if let Some((channel, note, _)) = previous_track {
-                    self.focused_channel = channel;
-                    self.focused_note = note;
-                };
-            }
-            (UiState::EditSection, Event::Key(Key::Char('j'))) => {
-                let next_track = section
-                    .iter()
-                    .skip_while(|&(channel, note, _)| {
-                        channel != focused_channel || note != focused_note
-                    })
-                    .skip(1)
-                    .next();
-                if let Some((channel, note, _)) = next_track {
-                    self.focused_channel = channel;
-                    self.focused_note = note;
-                };
-            }
-
-            (UiState::EditSection, Event::Key(Key::Char('g'))) => {
-                let first_track = section.iter().next();
-                if let Some((channel, note, _)) = first_track {
-                    self.focused_channel = channel;
-                    self.focused_note = note;
-                };
-            }
-            (UiState::EditSection, Event::Key(Key::Char('G'))) => {
-                let last_track = section.iter().last();
-                if let Some((channel, note, _)) = last_track {
-                    self.focused_channel = channel;
-                    self.focused_note = note;
-                };
-            }
-
-            (UiState::EditSection, Event::Key(Key::Char('.'))) => {
-                if let Some(track) = &mut section.tracks[self.focused_channel][self.focused_note] {
-                    track.steps[self.focused_step] = match track.steps[self.focused_step] {
-                        Step::On => Step::Off,
-                        _ => Step::On,
-                    };
-                    self.focused_step = (self.focused_step + 1) % track.steps.len();
-                }
-            }
-
-            (UiState::EditSection, Event::Key(Key::Char('-'))) => {
-                if let Some(track) = &mut section.tracks[self.focused_channel][self.focused_note] {
-                    track.steps[self.focused_step] = match track.steps[self.focused_step] {
-                        Step::Hold => Step::Off,
-                        _ => Step::Hold,
-                    };
-                    self.focused_step = (self.focused_step + 1) % track.steps.len();
-                }
-            }
-
-            (UiState::EditSection, Event::Key(Key::Char('K'))) => {
-                self.state = UiState::ConstrainToKey(KeyField::new())
-            }
-            (UiState::ConstrainToKey(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(music::Key {
-                    tonic,
-                    accidental,
-                    mode,
-                    octave,
-                }) => {
-                    // Compute ten notes from the key.
-                    let degree = match tonic {
-                        ch @ 'c'..='g' => ch as i32 - 'c' as i32,
-                        ch @ 'a'..='b' => ch as i32 - 'a' as i32 + 'g' as i32 - 'c' as i32,
-                        _ => unreachable!(),
-                    };
-                    let root = Mode::Major.semitones(degree as u8);
-                    let accidental = match accidental {
-                        Some(Accidental::Flat) => -1,
-                        Some(Accidental::Sharp) => 1,
-                        _ => 0,
-                    };
-                    let notes = mode
-                        .intervals()
-                        .map(|interval| {
-                            (12 * octave as i32 + root as i32 + accidental + interval as i32)
-                                as usize
-                        })
-                        .take(10);
-
-                    // Clone the channel's tracks and form an iterator over them.
-                    let cloned_tracks = section.tracks[self.focused_channel].clone();
-                    let tracks = cloned_tracks
-                        .iter()
-                        .copied()
-                        .filter_map(|track| track)
-                        .chain(repeat(Track {
-                            mute: false,
-                            steps: [Step::Off; 16],
-                        }));
-
-                    // Zero out the channel's tracks and populate for each note.
-                    section.tracks[self.focused_channel] = [None; 128];
-                    for (note, track) in notes.zip(tracks) {
-                        section.tracks[self.focused_channel][note] = Some(track);
-                    }
-
-                    let (note, _) = section.iter_channel(self.focused_channel).last().unwrap();
-                    self.focused_note = note;
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-
-            (UiState::EditSection, Event::Key(Key::Char('b'))) => {
-                self.state = UiState::EditBpm(UnsignedField::new(10, 300))
-            }
-            (UiState::EditBpm(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(bpm) => {
-                    self.bpm = bpm;
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-
-            (UiState::EditSection, Event::Key(Key::Char('s'))) => {
-                self.state = UiState::EditSwing(UnsignedField::new(10, 9))
-            }
-            (UiState::EditSwing(field), event) => match field.update(event) {
-                FieldUpdateResult::NotReady => (),
-                FieldUpdateResult::Ready(swing) => {
-                    self.swing = swing;
-                    self.state = UiState::EditSection;
-                }
-                FieldUpdateResult::Cancel => {
-                    self.state = UiState::EditSection;
-                }
-            },
-            _ => (),
-        };
-        true
     }
     fn render_to_backend(&self) -> Result<(), SendError<backend::Song>> {
         let backend = match &self.backend {
@@ -692,7 +313,8 @@ impl Ui {
             None => return Ok(()),
         };
         let sections =
-            self.sections
+            self.song
+                .sections
                 .iter()
                 .map(|section| {
                     let mut events: Vec<_> =
@@ -703,7 +325,7 @@ impl Ui {
                                 track.steps.iter().enumerate().filter_map(
                                     move |(step_index, step)| match step {
                                         Step::Hold | Step::Off => None,
-                                        Step::On => {
+                                        &Step::On { chance_to_fire } => {
                                             let steps_to_hold = 1 + track
                                                 .steps
                                                 .iter()
@@ -722,7 +344,7 @@ impl Ui {
                                                     velocity: 127,
                                                     duration: (steps_to_hold as f64 - 0.5)
                                                         / track.steps.len() as f64,
-                                                    chance_to_fire: 1.0,
+                                                    chance_to_fire: chance_to_fire as f64 / 100.0,
                                                 },
                                             })
                                         }
@@ -732,35 +354,45 @@ impl Ui {
                             .collect();
                     events.sort_unstable();
                     backend::Section {
-                        bpm: self.bpm,
-                        swing: self.swing as f64 / 9.0,
+                        bpm: self.song.bpm,
+                        swing: self.song.swing as f64 / 9.0,
                         events,
                     }
                 })
                 .collect();
-        backend.channels().song_tx.send(Song {
+        backend.channels().song_tx.send(backend::Song {
             paused: self.paused,
-            programs: self.programs,
+            programs: self.song.programs,
             sections,
         })?;
         Ok(())
     }
-    fn write(&self, writer: &mut impl Write, width: u16, height: u16) -> std::io::Result<()> {
+    fn write(&self, writer: &mut impl Write) -> std::io::Result<()> {
         let PlaybackState { clock, section } = self.playback_state;
         write!(
             writer,
-            "{}{}{} clock={:.2} section={} {} {} {} ",
+            "{}{}{} clock={:.2} section={} FOCUS section={} row={} step={} undo={} redo={} ",
             cursor::Goto(1, 1),
             clear::CurrentLine,
             if self.paused { "||" } else { " >" },
             clock,
             section,
-            self.focused_section,
-            self.focused_channel,
-            self.focused_note,
+            self.song.focused_section,
+            self.song.focused_row,
+            self.song.focused_step,
+            self.undo.len(),
+            self.redo.len(),
         )?;
+        let focus = self.song.sections[self.song.focused_section]
+            .iter()
+            .skip(self.song.focused_row)
+            .next()
+            .map(|(channel, note, track)| (channel, note, track.steps[self.song.focused_step]));
+        if let Some((_, _, Step::On { chance_to_fire })) = focus {
+            write!(writer, "r={} ", chance_to_fire)?;
+        }
 
-        match &self.state {
+        match &self.song.state {
             UiState::EditBpm(field) => {
                 write!(
                     writer,
@@ -886,9 +518,9 @@ impl Ui {
         };
         write!(writer, "\r\n\r\n")?;
 
-        let section = &self.sections[self.focused_section];
+        let section = &self.song.sections[self.song.focused_section];
         let mut last_channel = None;
-        for (channel, note, track) in section.iter() {
+        for (row, (channel, note, track)) in section.iter().enumerate() {
             if last_channel != Some(channel) {
                 write!(writer, "{:2} {:3}", channel, note)?;
                 last_channel = Some(channel);
@@ -902,18 +534,20 @@ impl Ui {
                 let ch = match step {
                     Step::Hold => '-',
                     Step::Off => ' ',
-                    Step::On
-                        if self.focused_section == self.playback_state.section
+                    Step::On { .. } => {
+                        if self.song.focused_section == self.playback_state.section
                             && !track.mute
-                            && step_index == active_step =>
-                    {
-                        '*'
+                            && step_index == active_step
+                        {
+                            '*'
+                        } else {
+                            '.'
+                        }
                     }
-                    Step::On => '.',
                 };
                 match (
-                    channel == self.focused_channel && note == self.focused_note,
-                    step_index == self.focused_step,
+                    row == self.song.focused_row,
+                    step_index == self.song.focused_step,
                 ) {
                     (true, true) => write!(
                         writer,
@@ -941,9 +575,447 @@ impl Ui {
         writer.flush()?;
         Ok(())
     }
+
+    fn push_to_undo_stack(&mut self) {
+        let mut song = self.song.clone();
+        song.state = UiState::EditSection;
+        self.undo.push(song);
+        self.redo.clear();
+    }
+
+    fn handle_input(&mut self, event: Event) -> bool {
+        match event {
+            Event::Key(Key::Ctrl('c')) => return false,
+            Event::Key(Key::Char(' ')) => {
+                self.paused = !self.paused;
+                return true;
+            }
+            _ => (),
+        };
+        let focus = self.song.sections[self.song.focused_section]
+            .iter()
+            .skip(self.song.focused_row)
+            .next()
+            .map(|(channel, note, _)| (channel, note));
+        match &mut self.song.state {
+            UiState::EditSection => match event {
+                Event::Key(Key::Char('C')) => {
+                    self.song.state = UiState::AddChannel(UnsignedField::new(10, 15))
+                }
+                Event::Key(Key::Char('c')) => {
+                    if let Some(_) = focus {
+                        self.song.state = UiState::EditChannel(UnsignedField::new(10, 15));
+                    }
+                }
+                Event::Key(Key::Char('N')) => {
+                    self.song.state = UiState::AddNote(UnsignedField::new(10, 127))
+                }
+                Event::Key(Key::Char('n')) => {
+                    if let Some(_) = focus {
+                        self.song.state = UiState::EditNote(UnsignedField::new(10, 127));
+                    }
+                }
+                Event::Key(Key::Char('p')) => {
+                    self.song.state = UiState::EditProgram(UnsignedField::new(10, 127));
+                }
+                Event::Key(Key::Char('m')) => {
+                    if let Some((channel, note)) = focus {
+                        if let Some(track) =
+                            &mut self.song.sections[self.song.focused_section].tracks[channel][note]
+                        {
+                            track.mute = !track.mute;
+                        }
+                    }
+                }
+
+                Event::Key(Key::Delete) => {
+                    if let Some((channel, note)) = focus {
+                        self.push_to_undo_stack();
+                        self.song.sections[self.song.focused_section].tracks[channel][note] = None;
+                        self.song.focused_row = self.song.sections[self.song.focused_section]
+                            .iter()
+                            .enumerate()
+                            .skip(self.song.focused_row)
+                            .next()
+                            .map(|(row, _)| row)
+                            .unwrap_or(0);
+                    }
+                }
+
+                Event::Key(Key::Char('h')) => {
+                    if let Some(_) = focus {
+                        self.song.focused_step = self.song.focused_step.saturating_sub(1);
+                    }
+                }
+                Event::Key(Key::Char('l')) => {
+                    if let Some(_) = focus {
+                        self.song.focused_step = (self.song.focused_step + 1) % NUM_STEPS;
+                    }
+                }
+
+                Event::Key(Key::Char('k')) => {
+                    if let Some(_) = focus {
+                        self.song.focused_row = self.song.focused_row.saturating_sub(1);
+                    }
+                }
+                Event::Key(Key::Char('j')) => {
+                    let rows = self.song.sections[self.song.focused_section].iter().count();
+                    if rows != 0 {
+                        self.song.focused_row = (self.song.focused_row + 1) % rows;
+                    }
+                }
+
+                Event::Key(Key::Char('g')) => {
+                    self.song.focused_row = 0;
+                }
+                Event::Key(Key::Char('G')) => {
+                    self.song.focused_row = self.song.sections[self.song.focused_section]
+                        .iter()
+                        .enumerate()
+                        .last()
+                        .map(|(row, _)| row)
+                        .unwrap_or(0);
+                }
+
+                Event::Key(Key::Char('0')) | Event::Key(Key::Char('^')) => {
+                    self.song.focused_step = 0;
+                }
+                Event::Key(Key::Char('$')) => {
+                    self.song.focused_step = NUM_STEPS - 1;
+                }
+
+                Event::Key(Key::Char('b')) => {
+                    let steps_per_measure = 4;
+                    self.song.focused_step = (self.song.focused_step / steps_per_measure + 3)
+                        % steps_per_measure
+                        * steps_per_measure;
+                }
+                Event::Key(Key::Char('w')) => {
+                    let steps_per_measure = 4;
+                    self.song.focused_step = (self.song.focused_step / steps_per_measure + 1)
+                        % steps_per_measure
+                        * steps_per_measure;
+                }
+
+                Event::Key(Key::Char('u')) => {
+                    if let Some(song) = self.undo.pop() {
+                        self.redo.push(self.song.clone());
+                        self.song = song;
+                    }
+                }
+                Event::Key(Key::Ctrl('r')) => {
+                    if let Some(song) = self.redo.pop() {
+                        self.undo.push(self.song.clone());
+                        self.song = song;
+                    }
+                }
+
+                Event::Key(Key::Char('r')) => {
+                    if let Some((channel, note)) = focus {
+                        if self.song.sections[self.song.focused_section].tracks[channel][note]
+                            .is_some()
+                        {
+                            self.push_to_undo_stack();
+                            self.song.state =
+                                UiState::EditChanceToFire(UnsignedField::new(10, 100));
+                        }
+                    }
+                }
+
+                Event::Key(Key::Char('.')) => {
+                    if let Some((channel, note)) = focus {
+                        if self.song.sections[self.song.focused_section].tracks[channel][note]
+                            .is_some()
+                        {
+                            self.push_to_undo_stack();
+                            let step = &mut self.song.sections[self.song.focused_section].tracks
+                                [channel][note]
+                                .as_mut()
+                                .unwrap()
+                                .steps[self.song.focused_step];
+                            *step = match *step {
+                                Step::On { .. } => Step::Off,
+                                _ => Step::On {
+                                    chance_to_fire: 100,
+                                },
+                            };
+                        }
+                    }
+                }
+
+                Event::Key(Key::Char('-')) => {
+                    if let Some((channel, note)) = focus {
+                        if self.song.sections[self.song.focused_section].tracks[channel][note]
+                            .is_some()
+                        {
+                            self.push_to_undo_stack();
+                            let step = &mut self.song.sections[self.song.focused_section].tracks
+                                [channel][note]
+                                .as_mut()
+                                .unwrap()
+                                .steps[self.song.focused_step];
+                            *step = match *step {
+                                Step::Hold => Step::Off,
+                                _ => Step::Hold,
+                            };
+                        }
+                    }
+                }
+
+                Event::Key(Key::Char('K')) => {
+                    self.song.state = UiState::ConstrainToKey(KeyField::new())
+                }
+                Event::Key(Key::Char('B')) => {
+                    self.song.state = UiState::EditBpm(UnsignedField::new(10, 240))
+                }
+                Event::Key(Key::Char('s')) => {
+                    self.song.state = UiState::EditSwing(UnsignedField::new(10, 9))
+                }
+
+                Event::Key(Key::Char('V')) => {
+                    // TODO Highlight!
+                }
+                _ => return true,
+            },
+
+            // TODO Abstraction to recognize keyboard input is captured, and is contributing to an edit.
+            // Much of this code is very redundant.
+            UiState::AddChannel(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(channel) => {
+                    let channel = channel as usize;
+                    if !self.song.sections[self.song.focused_section].tracks[channel]
+                        .iter()
+                        .any(|track| track.is_some())
+                    {
+                        self.push_to_undo_stack();
+                        self.song.sections[self.song.focused_section].tracks[channel][0] =
+                            Some(Track {
+                                mute: false,
+                                steps: [Step::Off; 16],
+                            });
+                        self.song.focused_row = self.song.sections[self.song.focused_section]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (c, n, _))| c == &channel && n == &0)
+                            .next()
+                            .map(|(row, _)| row)
+                            .unwrap();
+                    }
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+            UiState::EditChannel(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(channel) => {
+                    self.push_to_undo_stack();
+                    let new_channel = channel as usize;
+                    if let Some((channel, note)) = focus {
+                        self.song.sections[self.song.focused_section].tracks[new_channel][0] =
+                            self.song.sections[self.song.focused_section].tracks[channel][note]
+                                .take();
+                        self.song.focused_row = self.song.sections[self.song.focused_section]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (c, n, _))| c == &new_channel && n == &note)
+                            .next()
+                            .map(|(row, _)| row)
+                            .unwrap();
+                    }
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+
+            UiState::AddNote(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(note) => {
+                    let note = note as usize;
+                    let channel = if let Some((channel, _)) = focus {
+                        channel
+                    } else {
+                        0
+                    };
+                    if self.song.sections[self.song.focused_section].tracks[channel][note].is_none()
+                    {
+                        self.push_to_undo_stack();
+                        self.song.sections[self.song.focused_section].tracks[channel][note] =
+                            Some(Track {
+                                mute: false,
+                                steps: [Step::Off; 16],
+                            });
+                    }
+                    self.song.focused_row = self.song.sections[self.song.focused_section]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (c, n, _))| c == &channel && n == &note)
+                        .map(|(row, _)| row)
+                        .next()
+                        .unwrap();
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+            UiState::EditNote(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(note) => {
+                    self.push_to_undo_stack();
+                    let new_note = note as usize;
+                    if let Some((channel, note)) = focus {
+                        self.song.sections[self.song.focused_section].tracks[channel][new_note] =
+                            self.song.sections[self.song.focused_section].tracks[channel][note]
+                                .take();
+                        self.song.focused_row = self.song.sections[self.song.focused_section]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (c, n, _))| c == &channel && n == &new_note)
+                            .map(|(row, _)| row)
+                            .next()
+                            .unwrap();
+                    }
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+
+            UiState::EditProgram(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(program) => {
+                    self.push_to_undo_stack();
+                    if let Some((channel, _)) = focus {
+                        self.song.programs[channel] = program as u8;
+                    }
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+
+            UiState::EditChanceToFire(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Ready(chance_to_fire) => {
+                    if let Some((channel, note)) = focus {
+                        self.push_to_undo_stack();
+                        let step = &mut self.song.sections[self.song.focused_section].tracks
+                            [channel][note]
+                            .as_mut()
+                            .unwrap()
+                            .steps[self.song.focused_step];
+                        *step = Step::On {
+                            chance_to_fire: chance_to_fire as u8,
+                        };
+                    }
+                    self.song.state = UiState::EditSection;
+                }
+            },
+
+            UiState::ConstrainToKey(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(music::Key {
+                    tonic,
+                    accidental,
+                    mode,
+                    octave,
+                }) => {
+                    if let Some((channel, _)) = focus {
+                        self.push_to_undo_stack();
+                        // Compute ten notes from the key.
+                        let degree = match tonic {
+                            ch @ 'c'..='g' => ch as i32 - 'c' as i32,
+                            ch @ 'a'..='b' => ch as i32 - 'a' as i32 + 'g' as i32 - 'c' as i32,
+                            _ => unreachable!(),
+                        };
+                        let root = Mode::Major.semitones(degree as u8);
+                        let accidental = match accidental {
+                            Some(Accidental::Flat) => -1,
+                            Some(Accidental::Sharp) => 1,
+                            _ => 0,
+                        };
+                        let num_notes = 10;
+                        let notes = mode
+                            .intervals()
+                            .map(|interval| {
+                                (12 * octave as i32 + root as i32 + accidental + interval as i32)
+                                    as usize
+                            })
+                            .take(num_notes);
+
+                        // Clone the channel's tracks and form an iterator over them.
+                        let cloned_tracks =
+                            self.song.sections[self.song.focused_section].tracks[channel].clone();
+                        let tracks = cloned_tracks
+                            .iter()
+                            .copied()
+                            .filter_map(|track| track)
+                            .chain(repeat(Track {
+                                mute: false,
+                                steps: [Step::Off; 16],
+                            }));
+
+                        // Zero out the channel's tracks and populate for each note.
+                        self.song.sections[self.song.focused_section].tracks[channel] = [None; 128];
+                        for (note, track) in notes.zip(tracks) {
+                            self.song.sections[self.song.focused_section].tracks[channel][note] =
+                                Some(track);
+                            self.song.focused_row = self.song.sections[self.song.focused_section]
+                                .iter()
+                                .enumerate()
+                                .skip(self.song.focused_row)
+                                .next()
+                                .map(|(row, _)| row)
+                                .unwrap_or(num_notes - 1);
+                        }
+                    }
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+
+            UiState::EditBpm(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(bpm) => {
+                    self.push_to_undo_stack();
+                    self.song.bpm = bpm;
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+
+            UiState::EditSwing(field) => match field.update(&event) {
+                FieldUpdateResult::NotReady => (),
+                FieldUpdateResult::Ready(swing) => {
+                    self.push_to_undo_stack();
+                    self.song.swing = swing;
+                    self.song.state = UiState::EditSection;
+                }
+                FieldUpdateResult::Cancel => {
+                    self.song.state = UiState::EditSection;
+                }
+            },
+            _ => (),
+        };
+        true
+    }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Error> {
     // Set up panic hook.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -955,54 +1027,62 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Termion.
     let stdin = stdin();
-    let stdout = stdout().into_raw_mode()?;
-    let stdout = AlternateScreen::from(stdout);
-    let stdout = MouseTerminal::from(stdout);
-    let mut stdout = HideCursor::from(stdout);
-    let (error_tx, error_rx): (Sender<Box<dyn Error + Send>>, Receiver<_>) = crossbeam::bounded(0);
+    let mut stdout = {
+        let stdout = stdout().into_raw_mode()?;
+        let stdout = AlternateScreen::from(stdout);
+        let stdout = MouseTerminal::from(stdout);
+        HideCursor::from(stdout)
+    };
+    let (error_tx, error_rx): (Sender<Error>, Receiver<_>) = crossbeam::bounded(0);
     let (event_tx, event_rx) = crossbeam::bounded(0);
     spawn(move || {
-        for event in stdin.events() {
-            let event = match event {
-                Ok(event) => event,
-                Err(err) => {
-                    error_tx.send(Box::new(err)).ok();
-                    return;
-                }
-            };
-            if let Err(err) = event_tx.send(event) {
-                error_tx.send(Box::new(err)).ok();
-                return;
+        let result = (|| -> Result<(), Error> {
+            for event in stdin.events() {
+                let event = event?;
+                event_tx.send(event)?;
             }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            error_tx.send(err).ok();
         }
     });
+
     let mut ui = Ui {
-        bpm: 60,
-        swing: 0,
+        event_rx,
+        error_rx,
 
         paused: true,
+
+        song: Song {
+            bpm: 60,
+            swing: 0,
+
+            state: UiState::EditSection,
+            programs: [0; 16],
+            sections: vec![Section {
+                tracks: [[None; 128]; 16],
+            }],
+            focused_section: 0,
+            focused_row: 0,
+            focused_step: 0,
+        },
+
+        undo: Vec::new(),
+        redo: Vec::new(),
+
         playback_state: PlaybackState::default(),
         backend: Some(Box::new(backend)),
-
-        state: UiState::EditSection,
-        programs: [0; 16],
-        sections: vec![Section {
-            tracks: [[None; 128]; 16],
-        }],
-        focused_section: 0,
-        focused_channel: 0,
-        focused_note: 0,
-        focused_step: 0,
     };
     let (mut width, mut height) = termion::terminal_size()?;
-    while ui.step(&event_rx, &error_rx) {
+    while ui.step() {
         let (new_width, new_height) = termion::terminal_size()?;
         if (width, height) != (new_width, new_height) {
             write!(stdout, "{}", clear::All)?;
             width = new_width;
             height = new_height;
         }
-        ui.write(&mut stdout, width, height)?;
+        ui.write(&mut stdout)?;
     }
 
     // Wait for the audio thread to clear MIDI events.

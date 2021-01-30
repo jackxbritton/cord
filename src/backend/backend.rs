@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 pub enum EventFields {
     Note {
         note: u8,
-        velocity: u8,
+        velocity: (u8, u8),
         duration: f64,
         chance_to_fire: f64,
     },

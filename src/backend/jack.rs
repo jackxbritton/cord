@@ -2,6 +2,7 @@ use crate::backend;
 
 use backend::backend::{Backend, BackendChannels, Error, Event, EventFields, Song};
 use crossbeam::{Receiver, Sender, TrySendError};
+use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::default::Default;
@@ -66,6 +67,7 @@ impl Playback {
                     if chance_to_fire < rand::random() {
                         continue;
                     }
+                    let velocity = rand::thread_rng().gen_range(velocity.0..velocity.1);
                     self.midi_event_queue.push_back(MidiEvent {
                         time,
                         channel,
@@ -117,44 +119,52 @@ impl Playback {
         let result = match fields {
             MidiEventFields::NoteOn { note, velocity } => {
                 if self.midi_note_state[channel as usize][note as usize] {
-                    return Ok(());
+                    /*
+                    self.midi_event_queue.push_front(MidiEvent {
+                        time: 0.0, // TODO(jack)
+                        channel,
+                        fields: MidiEventFields::NoteOn { note, velocity },
+                    });
+                    self.midi_event_queue.push_front(MidiEvent {
+                        time: 0.0, // TODO(jack)
+                        channel,
+                        fields: MidiEventFields::NoteOff { note },
+                    });
+                    */
+                    Ok(())
+                } else {
+                    let result = writer.write(&jack::RawMidi {
+                        bytes: &[0x90 | channel, note, velocity],
+                        time,
+                    });
+                    if let Ok(_) = result {
+                        self.midi_note_state[channel as usize][note as usize] = true;
+                    }
+                    result
                 }
-                let result = writer.write(&jack::RawMidi {
-                    bytes: &[0x90 | channel, note, velocity],
-                    time,
-                });
-                if let Ok(_) = result {
-                    self.midi_note_state[channel as usize][note as usize] = true;
-                }
-                result
             }
             MidiEventFields::NoteOff { note } => {
                 if !self.midi_note_state[channel as usize][note as usize] {
-                    return Ok(());
+                    Ok(())
+                } else {
+                    let result = writer.write(&jack::RawMidi {
+                        bytes: &[0x80 | channel, note, 0],
+                        time,
+                    });
+                    if let Ok(_) = result {
+                        self.midi_note_state[channel as usize][note as usize] = false;
+                    }
+                    result
                 }
-                let result = writer.write(&jack::RawMidi {
-                    bytes: &[0x80 | channel, note, 0],
-                    time,
-                });
-                if let Ok(_) = result {
-                    self.midi_note_state[channel as usize][note as usize] = false;
-                }
-                result
             }
-            MidiEventFields::ControlChange { controller, value } => {
-                let result = writer.write(&jack::RawMidi {
-                    bytes: &[0xb0 | channel, controller, value],
-                    time,
-                });
-                result
-            }
-            MidiEventFields::ProgramChange { program } => {
-                let result = writer.write(&jack::RawMidi {
-                    bytes: &[0xc0 | channel, program],
-                    time,
-                });
-                result
-            }
+            MidiEventFields::ControlChange { controller, value } => writer.write(&jack::RawMidi {
+                bytes: &[0xb0 | channel, controller, value],
+                time,
+            }),
+            MidiEventFields::ProgramChange { program } => writer.write(&jack::RawMidi {
+                bytes: &[0xc0 | channel, program],
+                time,
+            }),
         };
         if let Err(_) = result {
             self.midi_event_queue.push_front(midi_event);

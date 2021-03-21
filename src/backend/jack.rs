@@ -11,16 +11,63 @@ use std::ops::Range;
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum MidiEventFields {
-    NoteOn { note: u8, velocity: u8 },
-    NoteOff { note: u8 },
-    ControlChange { controller: u8, value: u8 },
-    ProgramChange { program: u8 },
+    NoteOn {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    NoteOff {
+        channel: u8,
+        note: u8,
+    },
+    ControlChange {
+        channel: u8,
+        controller: u8,
+        value: u8,
+    },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
+    ClockPulse,
+    ClockStart,
+    ClockStop,
+    ClockContinue,
+}
+
+impl MidiEventFields {
+    fn to_bytes<'a>(self, buf: &'a mut [u8; 3]) -> &'a [u8] {
+        fn copy_from_slice<'a>(dest: &'a mut [u8], src: &[u8]) -> &'a [u8] {
+            let dest = &mut dest[..src.len()];
+            dest.copy_from_slice(src);
+            dest
+        }
+        match self {
+            Self::NoteOn {
+                channel,
+                note,
+                velocity,
+            } => copy_from_slice(buf, &[0x90 | channel, note, velocity]),
+            Self::NoteOff { channel, note } => copy_from_slice(buf, &[0x80 | channel, note, 0]),
+            Self::ControlChange {
+                channel,
+                controller,
+                value,
+            } => copy_from_slice(buf, &[0xb0 | channel, controller, value]),
+            Self::ProgramChange { channel, program } => {
+                copy_from_slice(buf, &[0xc0 | channel, program])
+            }
+            Self::ClockPulse => copy_from_slice(buf, &[0xf8]),
+            Self::ClockStart => copy_from_slice(buf, &[0xfa]),
+            Self::ClockContinue => copy_from_slice(buf, &[0xfb]),
+            Self::ClockStop => copy_from_slice(buf, &[0xfc]),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub struct MidiEvent {
     time: f64,
-    channel: u8,
     pub fields: MidiEventFields,
 }
 
@@ -70,20 +117,25 @@ impl Playback {
                     let velocity = rand::thread_rng().gen_range(velocity.0..velocity.1);
                     self.midi_event_queue.push_back(MidiEvent {
                         time,
-                        channel,
-                        fields: MidiEventFields::NoteOn { note, velocity },
+                        fields: MidiEventFields::NoteOn {
+                            channel,
+                            note,
+                            velocity,
+                        },
                     });
                     self.midi_event_queue.push_back(MidiEvent {
                         time: time + duration,
-                        channel,
-                        fields: MidiEventFields::NoteOff { note },
+                        fields: MidiEventFields::NoteOff { channel, note },
                     });
                 }
                 EventFields::ControlChange { controller, value } => {
                     self.midi_event_queue.push_back(MidiEvent {
                         time,
-                        channel,
-                        fields: MidiEventFields::ControlChange { controller, value },
+                        fields: MidiEventFields::ControlChange {
+                            channel,
+                            controller,
+                            value,
+                        },
                     });
                 }
             };
@@ -113,59 +165,9 @@ impl Playback {
         midi_event: MidiEvent,
         time: u32,
     ) -> Result<(), jack::Error> {
-        let MidiEvent {
-            channel, fields, ..
-        } = midi_event;
-        let result = match fields {
-            MidiEventFields::NoteOn { note, velocity } => {
-                if self.midi_note_state[channel as usize][note as usize] {
-                    /*
-                    self.midi_event_queue.push_front(MidiEvent {
-                        time: 0.0, // TODO(jack)
-                        channel,
-                        fields: MidiEventFields::NoteOn { note, velocity },
-                    });
-                    self.midi_event_queue.push_front(MidiEvent {
-                        time: 0.0, // TODO(jack)
-                        channel,
-                        fields: MidiEventFields::NoteOff { note },
-                    });
-                    */
-                    Ok(())
-                } else {
-                    let result = writer.write(&jack::RawMidi {
-                        bytes: &[0x90 | channel, note, velocity],
-                        time,
-                    });
-                    if let Ok(_) = result {
-                        self.midi_note_state[channel as usize][note as usize] = true;
-                    }
-                    result
-                }
-            }
-            MidiEventFields::NoteOff { note } => {
-                if !self.midi_note_state[channel as usize][note as usize] {
-                    Ok(())
-                } else {
-                    let result = writer.write(&jack::RawMidi {
-                        bytes: &[0x80 | channel, note, 0],
-                        time,
-                    });
-                    if let Ok(_) = result {
-                        self.midi_note_state[channel as usize][note as usize] = false;
-                    }
-                    result
-                }
-            }
-            MidiEventFields::ControlChange { controller, value } => writer.write(&jack::RawMidi {
-                bytes: &[0xb0 | channel, controller, value],
-                time,
-            }),
-            MidiEventFields::ProgramChange { program } => writer.write(&jack::RawMidi {
-                bytes: &[0xc0 | channel, program],
-                time,
-            }),
-        };
+        let mut buf = [0; 3];
+        let bytes = midi_event.fields.to_bytes(&mut buf);
+        let result = writer.write(&jack::RawMidi { bytes, time });
         if let Err(_) = result {
             self.midi_event_queue.push_front(midi_event);
         }
@@ -189,6 +191,16 @@ impl Playback {
         let buffer_period = buffer_size as f64 / sample_rate as f64;
         let dt = buffer_period / seconds_per_measure;
         let new_clock = self.clock + dt;
+
+        // Clock pulses.
+        let pulses_per_measure = beats_per_measure as f64 * 24.0;
+        let pulses = (new_clock * pulses_per_measure - self.clock * pulses_per_measure) as u32;
+        for _ in 0..pulses {
+            self.midi_event_queue.push_front(MidiEvent {
+                time: 0.0,
+                fields: MidiEventFields::ClockPulse,
+            });
+        }
 
         if !self.song.paused {
             if new_clock < 1.0 {
@@ -259,7 +271,14 @@ impl<N, P> JackBackend<N, P> {
             song,
             section: 0,
             clock: 0.0,
-            midi_event_queue: VecDeque::with_capacity(32),
+            midi_event_queue: {
+                let mut queue = VecDeque::with_capacity(32);
+                queue.push_front(MidiEvent {
+                    time: 0.0,
+                    fields: MidiEventFields::ClockStart,
+                });
+                queue
+            },
             midi_note_state: [[false; 128]; 16],
         };
         let process_handler =
@@ -276,8 +295,21 @@ impl<N, P> JackBackend<N, P> {
                     for (channel, &program) in changed_programs {
                         playback.midi_event_queue.push_front(MidiEvent {
                             time: 0.0,
-                            channel: channel as u8,
-                            fields: MidiEventFields::ProgramChange { program },
+                            fields: MidiEventFields::ProgramChange {
+                                channel: channel as u8,
+                                program,
+                            },
+                        });
+                    }
+                    if new_song.paused && !playback.song.paused {
+                        playback.midi_event_queue.push_front(MidiEvent {
+                            time: 0.0,
+                            fields: MidiEventFields::ClockStop,
+                        });
+                    } else if !new_song.paused && playback.song.paused {
+                        playback.midi_event_queue.push_front(MidiEvent {
+                            time: 0.0,
+                            fields: MidiEventFields::ClockContinue,
                         });
                     }
                     playback.song = new_song;

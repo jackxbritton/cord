@@ -1257,7 +1257,7 @@ fn main() -> Result<(), Error> {
         event_rx,
         error_rx,
 
-        paused: true,
+        paused: false,
 
         song: Song {
             bpm: 60,

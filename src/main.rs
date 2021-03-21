@@ -272,6 +272,7 @@ enum Step {
     On {
         velocity: (u8, u8),
         chance_to_fire: u8,
+        delay: f64,
     },
 }
 
@@ -297,19 +298,6 @@ impl Section {
                 tracks.iter().enumerate().filter_map(move |(note, track)| {
                     track.as_ref().map(|track| (channel, note, track))
                 })
-            })
-    }
-    fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (usize, usize, &mut Track)> {
-        self.tracks
-            .iter_mut()
-            .enumerate()
-            .flat_map(move |(channel, tracks)| {
-                tracks
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(move |(note, track)| {
-                        track.as_mut().map(|track| (channel, note, track))
-                    })
             })
     }
 }
@@ -397,57 +385,59 @@ impl Ui {
             Some(backend) => backend,
             None => return Ok(()),
         };
-        let sections =
-            self.song
-                .sections
-                .iter()
-                .map(|section| {
-                    let mut events: Vec<_> =
-                        section
+        let sections = self
+            .song
+            .sections
+            .iter()
+            .map(|section| {
+                let mut events: Vec<_> = section
+                    .iter()
+                    .filter(|(_, _, track)| !track.mute)
+                    .flat_map(move |(channel, note, track)| {
+                        track
+                            .steps
                             .iter()
-                            .filter(|(_, _, track)| !track.mute)
-                            .flat_map(move |(channel, note, track)| {
-                                track.steps.iter().enumerate().filter_map(
-                                    move |(step_index, step)| match step {
-                                        Step::Hold | Step::Off => None,
-                                        &Step::On {
-                                            chance_to_fire,
+                            .enumerate()
+                            .filter_map(move |(step_index, step)| match step {
+                                Step::Hold | Step::Off => None,
+                                &Step::On {
+                                    chance_to_fire,
+                                    velocity,
+                                    delay,
+                                } => {
+                                    let steps_to_hold = 1 + track
+                                        .steps
+                                        .iter()
+                                        .cycle()
+                                        .skip(step_index + 1)
+                                        .take_while(|step| match step {
+                                            Step::Hold => true,
+                                            _ => false,
+                                        })
+                                        .count();
+                                    Some(backend::Event {
+                                        time: step_index as f64 + delay / track.steps.len() as f64,
+                                        channel: channel as u8,
+                                        fields: EventFields::Note {
+                                            note: note as u8,
                                             velocity,
-                                        } => {
-                                            let steps_to_hold = 1 + track
-                                                .steps
-                                                .iter()
-                                                .cycle()
-                                                .skip(step_index + 1)
-                                                .take_while(|step| match step {
-                                                    Step::Hold => true,
-                                                    _ => false,
-                                                })
-                                                .count();
-                                            Some(backend::Event {
-                                                time: step_index as f64 / track.steps.len() as f64,
-                                                channel: channel as u8,
-                                                fields: EventFields::Note {
-                                                    note: note as u8,
-                                                    velocity,
-                                                    duration: (steps_to_hold as f64 - 0.5)
-                                                        / track.steps.len() as f64,
-                                                    chance_to_fire: chance_to_fire as f64 / 100.0,
-                                                },
-                                            })
-                                        }
-                                    },
-                                )
+                                            duration: (steps_to_hold as f64 - 0.5)
+                                                / track.steps.len() as f64,
+                                            chance_to_fire: chance_to_fire as f64 / 100.0,
+                                        },
+                                    })
+                                }
                             })
-                            .collect();
-                    events.sort_unstable();
-                    backend::Section {
-                        bpm: self.song.bpm,
-                        swing: self.song.swing as f64 / 9.0,
-                        events,
-                    }
-                })
-                .collect();
+                    })
+                    .collect();
+                events.sort_unstable();
+                backend::Section {
+                    bpm: self.song.bpm,
+                    swing: self.song.swing as f64 / 9.0,
+                    events,
+                }
+            })
+            .collect();
         backend.channels().song_tx.send(backend::Song {
             paused: self.paused,
             programs: self.song.programs,
@@ -474,12 +464,13 @@ impl Ui {
         if let Some(Step::On {
             chance_to_fire,
             velocity,
+            delay,
         }) = focus
         {
             write!(
                 writer,
-                "r={} v={}..{}",
-                chance_to_fire, velocity.0, velocity.1
+                "r={} v={}..{} d={:.2}",
+                chance_to_fire, velocity.0, velocity.1, delay
             )?;
         }
 
@@ -659,6 +650,7 @@ impl Ui {
                         if self.song.focused_section == self.playback_state.section
                             && !track.mute
                             && step_index == active_step
+                            && self.playback_state.midi_note_state[channel][note]
                         {
                             '*'
                         } else {
@@ -915,6 +907,7 @@ impl Ui {
                             Step::On {
                                 chance_to_fire: 100,
                                 velocity: (127, 128),
+                                delay: 0.0,
                             }
                         };
                     }
@@ -1276,7 +1269,11 @@ fn main() -> Result<(), Error> {
         undo: Vec::new(),
         redo: Vec::new(),
 
-        playback_state: PlaybackState::default(),
+        playback_state: PlaybackState {
+            clock: 0.0,
+            section: 0,
+            midi_note_state: [[false; 128]; 16],
+        },
         backend: Some(Box::new(backend)),
     };
     let (mut width, mut height) = termion::terminal_size()?;

@@ -166,6 +166,19 @@ impl Playback {
         time: u32,
     ) -> Result<(), jack::Error> {
         let mut buf = [0; 3];
+        match midi_event.fields {
+            MidiEventFields::NoteOn { channel, note, .. }
+                if self.midi_note_state[channel as usize][note as usize] =>
+            {
+                return Ok(())
+            }
+            MidiEventFields::NoteOff { channel, note }
+                if self.midi_note_state[channel as usize][note as usize] =>
+            {
+                return Ok(())
+            }
+            _ => (),
+        };
         let bytes = midi_event.fields.to_bytes(&mut buf);
         let result = writer.write(&jack::RawMidi { bytes, time });
         if let Err(_) = result {
@@ -264,6 +277,7 @@ impl<N, P> JackBackend<N, P> {
             "cord",
             jack::ClientOptions::NO_START_SERVER | jack::ClientOptions::USE_EXACT_NAME,
         )?;
+        let mut input_port = client.register_port("in", jack::MidiIn::default())?;
         let mut output_port = client.register_port("out", jack::MidiOut::default())?;
         let mut song = Song::default();
         song.paused = true;
@@ -316,6 +330,9 @@ impl<N, P> JackBackend<N, P> {
                 };
                 quit = quit_rx.try_recv().is_ok() || quit;
 
+                // TODO(jack) Record events.
+                for jack::RawMidi { time, bytes } in input_port.iter(ps) {}
+
                 let mut writer = output_port.writer(ps);
 
                 // If we're exiting, just drain the queue.
@@ -348,6 +365,7 @@ impl<N, P> JackBackend<N, P> {
                     playback_state_tx.try_send(backend::PlaybackState {
                         clock: playback.apply_swing_to_clock(playback.clock),
                         section: playback.section,
+                        midi_note_state: playback.midi_note_state,
                     })
                 {
                     return jack::Control::Quit;

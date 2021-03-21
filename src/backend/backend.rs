@@ -43,10 +43,10 @@ pub struct Song {
     pub sections: Vec<Section>,
 }
 
-#[derive(Default)]
 pub struct PlaybackState {
     pub clock: f64,
     pub section: usize,
+    pub midi_note_state: [[bool; 128]; 16],
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

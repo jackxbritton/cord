@@ -5,7 +5,7 @@ authors = ["Jack Britton <jackxbritton@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-arrayvec = "0.7.0"
 crossbeam = "0.8.0"
 jack = "0.7.0"
 termion = "1.5.6"
+tinyvec = "1.2.0"

@@ -1,7 +1,10 @@
 mod midi;
 mod seq;
 
+use std::default::Default;
 use std::io::{stdin, stdout, Write};
+use std::iter::{once, repeat};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::spawn;
 
 use crossbeam::channel::{Receiver, Sender};
@@ -11,6 +14,7 @@ use termion::event::{Event, Key};
 use termion::input::{MouseTerminal, TermRead};
 use termion::raw::IntoRawMode;
 use termion::screen::AlternateScreen;
+use tinyvec::ArrayVec;
 
 struct NotificationHandler {
     shutdown_tx: crossbeam::channel::Sender<()>,
@@ -22,7 +26,7 @@ impl jack::NotificationHandler for NotificationHandler {
     }
 }
 
-struct ProcessHandler {
+struct ProcessHandler<'a> {
     midi_in_port: jack::Port<jack::MidiIn>,
     midi_out_port: jack::Port<jack::MidiOut>,
 
@@ -31,22 +35,19 @@ struct ProcessHandler {
 
     midi_event_queue: Vec<(f64, midi::Event)>,
 
-    t: f64,
+    clock: f64,
 
-    // TODO(jack) Can we abstract a pattern for data that gets replaced through channels?
-    // Possibly a crossbeam atomic?
     seq: Vec<(f64, seq::Event)>,
     seq_rx: Receiver<Vec<(f64, seq::Event)>>,
 
     seq_event_tx: Sender<(f64, seq::Event)>,
     state_tx: Sender<f64>,
 
-    flush: bool,
-    flush_rx: Receiver<()>,
+    flush: &'a AtomicBool,
 
     shutdown_tx: Sender<()>,
 }
-impl jack::ProcessHandler for ProcessHandler {
+impl<'a> jack::ProcessHandler for ProcessHandler<'a> {
     fn process(
         &mut self,
         client: &jack::Client,
@@ -58,13 +59,12 @@ impl jack::ProcessHandler for ProcessHandler {
             held_incoming_midi_notes,
             held_outgoing_midi_notes,
             midi_event_queue,
-            t,
+            clock,
             seq,
             seq_rx,
             seq_event_tx,
             state_tx,
             flush,
-            flush_rx,
             shutdown_tx,
         } = self;
         if let Some(new_seq) = seq_rx.try_iter().last() {
@@ -72,8 +72,7 @@ impl jack::ProcessHandler for ProcessHandler {
         }
 
         let mut writer = midi_out_port.writer(process_scope);
-        *flush = *flush || flush_rx.try_iter().next().is_some();
-        if *flush {
+        if flush.load(Ordering::Relaxed) {
             for (channel, notes) in held_outgoing_midi_notes.iter_mut().enumerate() {
                 for (note, count) in notes.iter_mut().enumerate() {
                     for _ in 0..*count {
@@ -93,10 +92,10 @@ impl jack::ProcessHandler for ProcessHandler {
                 }
             }
             shutdown_tx.send(()).unwrap();
-            return jack::Control::Quit;
+            return jack::Control::Continue; // Quit causes problems.
         }
 
-        let bpm = 85.0;
+        let bpm = 75.0;
         let beats = 4.0;
         let dt = bpm / 60.0 / beats * client.buffer_size() as f64 / client.sample_rate() as f64;
 
@@ -108,16 +107,25 @@ impl jack::ProcessHandler for ProcessHandler {
             if let Some(event) = midi::Event::from_bytes(bytes) {
                 let time = sample as f64 / client.buffer_size() as f64 * dt;
                 midi_event_queue.push((time, event));
-                if let Some(event) = match event {
-                    midi::Event::NoteOff { channel, note } => held_incoming_midi_notes
-                        [channel as usize][note as usize]
-                        .take()
-                        .map(|(length, velocity)| seq::Event::Note {
-                            channel,
-                            note,
-                            velocity,
-                            length,
-                        }),
+                let time = *clock + time;
+                match event {
+                    midi::Event::NoteOff { channel, note } => {
+                        if let Some((start, velocity)) =
+                            held_incoming_midi_notes[channel as usize][note as usize].take()
+                        {
+                            seq_event_tx
+                                .send((
+                                    start,
+                                    seq::Event::Note {
+                                        channel,
+                                        note,
+                                        velocity,
+                                        length: (time - start).rem_euclid(1.0),
+                                    },
+                                ))
+                                .unwrap();
+                        }
+                    }
                     midi::Event::NoteOn {
                         channel,
                         note,
@@ -125,19 +133,23 @@ impl jack::ProcessHandler for ProcessHandler {
                     } => {
                         held_incoming_midi_notes[channel as usize][note as usize] =
                             Some((time, (velocity as f64 - 1.0) / 126.0));
-                        None
                     }
                     midi::Event::ControlChange {
                         channel,
                         controller,
                         value,
-                    } => Some(seq::Event::ControlChange {
-                        channel,
-                        controller,
-                        value,
-                    }),
-                } {
-                    seq_event_tx.send((*t + time, event)).unwrap();
+                    } => {
+                        seq_event_tx
+                            .send((
+                                time,
+                                seq::Event::ControlChange {
+                                    channel,
+                                    controller,
+                                    value,
+                                },
+                            ))
+                            .unwrap();
+                    }
                 }
             }
         }
@@ -177,9 +189,9 @@ impl jack::ProcessHandler for ProcessHandler {
                 }
             }
         }
-        let t1 = *t;
-        let t2 = *t + dt;
-        *t = if t2 < 1.0 {
+        let t1 = *clock;
+        let t2 = *clock + dt;
+        *clock = if t2 < 1.0 {
             for &mut (time, event) in seq {
                 if t1 <= time && time < t2 {
                     schedule(midi_event_queue, time - t1, event);
@@ -198,7 +210,7 @@ impl jack::ProcessHandler for ProcessHandler {
             }
             t2
         };
-        state_tx.send(*t).unwrap();
+        state_tx.send(*clock).unwrap();
 
         midi_event_queue.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
         while let Some((time, event)) = midi_event_queue.pop() {
@@ -224,18 +236,106 @@ impl jack::ProcessHandler for ProcessHandler {
             }
         }
 
-        for (time, _) in held_incoming_midi_notes
-            .iter_mut()
-            .flat_map(|x| x.iter_mut())
-            .filter_map(|x| x.as_mut())
-        {
-            *time += dt;
-        }
         for (time, _) in midi_event_queue {
             *time -= dt;
         }
 
         jack::Control::Continue
+    }
+}
+
+static FLUSH: AtomicBool = AtomicBool::new(false);
+
+#[derive(Copy, Clone, Debug, Default)]
+struct Step {
+    velocity: f64,
+    length: f64,
+    delay: f64,
+}
+
+const NUM_STEPS: usize = 16;
+
+type Track = [Option<Step>; NUM_STEPS];
+type Tracks = [[Option<Track>; 128]; 16];
+
+struct Ui {
+    step: u16,
+    tracks: Tracks,
+}
+
+impl Ui {
+    fn iter_tracks(&self) -> impl Iterator<Item = (u8, u8, &Track)> + '_ {
+        self.tracks.iter().enumerate().flat_map(|(channel, notes)| {
+            notes.iter().enumerate().filter_map(move |(note, steps)| {
+                steps
+                    .as_ref()
+                    .map(|steps| (channel as u8, note as u8, steps))
+            })
+        })
+    }
+    fn transpose(&mut self, degrees: i32) {
+        let mut new_tracks: Tracks = [[None; 128]; 16];
+        for (channel, note, steps) in self.iter_tracks() {
+            let intervals = [2, 2, 1, 2, 2, 2, 1];
+            let octave = note / 12;
+            let degree = intervals
+                .iter()
+                .enumerate()
+                .take_while({
+                    let mut acc = 0;
+                    move |&(_, &x)| {
+                        acc += x;
+                        acc <= note % 12
+                    }
+                })
+                .last()
+                .map_or(0, |(i, _)| i + 1);
+            let constrained_note: i32 =
+                ((octave * 7) as i32 + degree as i32 + degrees).clamp(0, 62); // I did some back-of-the-napkin math.
+            let octave = constrained_note / 7;
+            let degree = constrained_note % 7;
+            let new_note = 12 * octave + intervals.iter().take(degree as usize).sum::<u8>() as i32;
+            new_tracks[channel as usize][new_note as usize] = Some(*steps);
+        }
+        self.tracks = new_tracks;
+    }
+    fn print_tracks(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        write!(writer, "{}", termion::cursor::Goto(1, 1))?;
+        for (channel, notes) in self.tracks.iter().enumerate() {
+            for ((note, steps), first) in notes
+                .iter()
+                .enumerate()
+                .filter_map(|(note, steps)| steps.map(|steps| (note, steps)))
+                .zip(once(true).chain(repeat(false)))
+            {
+                if first {
+                    write!(writer, "c{:02} ", channel)?;
+                } else {
+                    write!(writer, "    ")?;
+                }
+                write!(writer, "n{:03} |", note)?;
+                for step in steps.iter() {
+                    write!(writer, "{}", if step.is_some() { "." } else { " " })?;
+                }
+                write!(writer, "|\r\n")?;
+            }
+        }
+        Ok(())
+    }
+    fn print_cursor(&self, writer: &mut impl Write) -> std::io::Result<()> {
+        let row = 1 + self
+            .tracks
+            .iter()
+            .flat_map(|notes| notes.iter())
+            .filter_map(|steps| steps.as_ref())
+            .count() as u16;
+        write!(
+            writer,
+            "{}{}^\r\n",
+            termion::cursor::Goto(10 + self.step, row),
+            termion::clear::CurrentLine,
+        )?;
+        Ok(())
     }
 }
 
@@ -251,7 +351,6 @@ fn main() {
         .unwrap();
 
     let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded(2);
-    let (flush_tx, flush_rx) = crossbeam::channel::bounded(0);
     let (seq_tx, seq_rx) = crossbeam::channel::bounded(0);
     let (seq_event_tx, seq_event_rx) = crossbeam::channel::bounded(256);
     let (state_tx, state_rx) = crossbeam::channel::bounded(1024);
@@ -266,13 +365,12 @@ fn main() {
                 held_incoming_midi_notes: [[None; 128]; 16],
                 held_outgoing_midi_notes: [[0; 128]; 16],
                 midi_event_queue: Vec::with_capacity(64),
-                t: 0.0,
+                clock: 0.0,
                 seq: Vec::new(),
                 seq_rx,
                 seq_event_tx,
                 state_tx,
-                flush: false,
-                flush_rx,
+                flush: &FLUSH,
                 shutdown_tx,
             },
         )
@@ -310,69 +408,33 @@ fn main() {
         }
     });
 
-    #[derive(Copy, Clone, Debug, Default)]
-    struct Step {
-        velocity: f64,
-        length: f64,
-        delay: f64,
-    }
-    const NUM_STEPS: usize = 16;
-    let mut tracks = [[[None; NUM_STEPS]; 128]; 16];
+    let mut ui = Ui {
+        step: 0,
+        tracks: [[None; 128]; 16],
+    };
+    seq_tx.send(tracks_to_seq(&ui)).unwrap();
 
-    fn print_tracks(
-        stdout: &mut impl Write,
-        tracks: &[[[Option<Step>; NUM_STEPS]; 128]; 16],
-        clock: f64,
-    ) -> Result<(), std::io::Error> {
-        write!(
-            stdout,
-            "{}{}",
-            termion::clear::All,
-            termion::cursor::Goto(1, 1)
-        )?;
-        for (channel, notes) in tracks.iter().enumerate() {
-            for (note, steps) in notes.iter().enumerate() {
-                if steps.iter().any(|step| step.is_some()) {
-                    write!(stdout, "c{:02} n{:03} |", channel, note)?;
-                    for step in steps.iter() {
-                        write!(stdout, "{}", if step.is_some() { "." } else { " " })?;
-                    }
-                    write!(stdout, "|\r\n")?;
-                }
-            }
-        }
-        let clock_step = (clock * NUM_STEPS as f64) as u16;
-        write!(stdout, "{}^\r\n", termion::cursor::Right(10 + clock_step))?;
-        Ok(())
-    }
-
-    fn tracks_to_seq(tracks: &[[[Option<Step>; NUM_STEPS]; 128]; 16]) -> Vec<(f64, seq::Event)> {
-        let steps = tracks.iter().enumerate().flat_map(|(channel, notes)| {
-            notes.iter().enumerate().flat_map(move |(note, steps)| {
-                steps
-                    .iter()
-                    .enumerate()
-                    .flat_map(move |(i, step)| match step {
-                        Some(step) => Some((channel as u8, note as u8, i, step)),
-                        None => None,
-                    })
+    fn tracks_to_seq(ui: &Ui) -> Vec<(f64, seq::Event)> {
+        let mut seq: Vec<_> = ui
+            .iter_tracks()
+            .flat_map(|(channel, note, steps)| {
+                steps.iter().enumerate().filter_map(move |(i, step)| {
+                    step.map(|step| (channel, note, i as f64 / steps.len() as f64, step))
+                })
             })
-        });
-        let mut seq: Vec<_> = steps
             .map(
                 |(
                     channel,
                     note,
-                    i,
-                    &Step {
+                    t,
+                    Step {
                         velocity,
                         length,
                         delay,
                     },
                 )| {
-                    let t = (i as f64 + delay) / NUM_STEPS as f64;
                     (
-                        t,
+                        t + delay,
                         seq::Event::Note {
                             channel,
                             note,
@@ -387,8 +449,6 @@ fn main() {
         seq
     }
 
-    let mut clock = 0.0;
-
     'running: loop {
         select! {
             recv(shutdown_rx) -> _ => return,
@@ -396,41 +456,63 @@ fn main() {
                 let (time, event) = result.unwrap();
                 match event {
                     seq::Event::Note {channel, note, velocity, length} => {
-                        let step = (time * NUM_STEPS as f64) as usize;
-                        let delay = (time * NUM_STEPS as f64) % 1.0;
-                        tracks[channel as usize][note as usize][step] = Some(Step{velocity, length, delay});
-                        seq_tx.send(tracks_to_seq(&tracks)).unwrap();
+                        let mut steps = ui.tracks[channel as usize][note as usize].unwrap_or([None; NUM_STEPS]);
+                        let step = (time * steps.len() as f64) as usize;
+                        let delay = time % (1.0 / steps.len() as f64);
+                        steps[step] = Some(Step{velocity, length, delay});
+                        ui.tracks[channel as usize][note as usize] = Some(steps);
+                        seq_tx.send(tracks_to_seq(&ui)).unwrap();
                     },
                     _ => continue 'running,
                 }
-                print_tracks(&mut stdout, &tracks, clock).unwrap();
+                ui.print_tracks(&mut stdout).unwrap();
             },
             recv(event_rx) -> result => {
                 let event = result.unwrap();
                 match event {
                     Event::Key(Key::Ctrl('c')) => break 'running,
-                    Event::Key(Key::Delete) => tracks = [[[None; NUM_STEPS]; 128]; 16],
+                    Event::Key(Key::Delete) => ui.tracks = [[None; 128]; 16],
                     Event::Key(Key::Char('Q')) => {
-                        let steps = tracks
+                        let steps = ui.tracks
                             .iter_mut()
                             .flat_map(|notes| notes.iter_mut())
+                            .filter_map(|steps| steps.as_mut())
                             .flat_map(|steps| steps.iter_mut())
                             .filter_map(|step| step.as_mut());
                         for step in steps {
                             step.delay = 0.0;
                         }
-                        seq_tx.send(tracks_to_seq(&tracks)).unwrap();
+                        seq_tx.send(tracks_to_seq(&ui)).unwrap();
                     },
+                    Event::Key(Key::Ctrl('l')) => {
+                        write!(stdout, "{}", termion::clear::All).unwrap();
+                        ui.print_tracks(&mut stdout).unwrap();
+                        ui.print_cursor(&mut stdout).unwrap();
+                    }
+                    Event::Key(Key::Char('<')) => {
+                        ui.transpose(-1);
+                        seq_tx.send(tracks_to_seq(&ui)).unwrap();
+                        ui.print_tracks(&mut stdout).unwrap();
+                    }
+                    Event::Key(Key::Char('>')) => {
+                        ui.transpose(1);
+                        seq_tx.send(tracks_to_seq(&ui)).unwrap();
+                        ui.print_tracks(&mut stdout).unwrap();
+                    }
                     _ => (),
                 }
             },
             recv(state_rx) -> result => {
-                clock = result.unwrap();
-                print_tracks(&mut stdout, &tracks, clock).unwrap();
+                let clock = result.unwrap();
+                let step = (clock * 16 as f64) as u16;
+                if ui.step != step {
+                    ui.step = step;
+                    ui.print_cursor(&mut stdout).unwrap();
+                }
             }
         }
     }
 
-    flush_tx.send(()).unwrap();
+    FLUSH.store(true, Ordering::Relaxed);
     shutdown_rx.recv().unwrap();
 }

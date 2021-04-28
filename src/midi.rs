@@ -1,4 +1,4 @@
-use arrayvec::ArrayVec;
+use tinyvec::ArrayVec;
 
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
 pub enum Event {
@@ -42,7 +42,7 @@ impl Event {
             _ => None,
         }
     }
-    pub fn to_bytes(self) -> ArrayVec<u8, 4> {
+    pub fn to_bytes(self) -> ArrayVec<[u8; 4]> {
         let mut out = ArrayVec::new();
         match self {
             Event::NoteOff { channel, note } => {

@@ -253,9 +253,8 @@ struct Step {
     delay: f64,
 }
 
-const NUM_STEPS: usize = 16;
-
-type Track = [Option<Step>; NUM_STEPS];
+const MAX_STEPS: usize = 16;
+type Track = ArrayVec<[Option<Step>; MAX_STEPS]>;
 type Tracks = [[Option<Track>; 128]; 16];
 
 struct Ui {
@@ -456,7 +455,7 @@ fn main() {
                 let (time, event) = result.unwrap();
                 match event {
                     seq::Event::Note {channel, note, velocity, length} => {
-                        let mut steps = ui.tracks[channel as usize][note as usize].unwrap_or([None; NUM_STEPS]);
+                        let mut steps = ui.tracks[channel as usize][note as usize].unwrap_or(ArrayVec::from([None; 16]));
                         let step = (time * steps.len() as f64) as usize;
                         let delay = time % (1.0 / steps.len() as f64);
                         steps[step] = Some(Step{velocity, length, delay});

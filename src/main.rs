@@ -1,10 +1,12 @@
-#![feature(box_into_boxed_slice)]
+// TODO(jack) Set velocity and groove.
 
 mod midi;
 mod seq;
 
+use std::collections::BTreeMap;
 use std::default::Default;
 use std::io::{stdin, stdout, Write};
+use std::mem::replace;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::spawn;
 
@@ -276,62 +278,47 @@ struct Step {
 const MAX_STEPS: usize = 32;
 type Track = ArrayVec<[Option<Step>; MAX_STEPS]>;
 
-#[derive(Copy, Clone)]
-struct Tracks([[Option<Track>; 128]; 16]);
+type Channel = u8;
+type Note = u8;
 
-impl Default for Tracks {
-    fn default() -> Self {
-        Self([[None; 128]; 16])
-    }
-}
+#[derive(Clone, Default)]
+struct Tracks(BTreeMap<(Channel, Note), Track>);
 
 impl Tracks {
-    fn iter_tracks(&self) -> impl DoubleEndedIterator<Item = (u8, u8, &Track)> + '_ {
-        let Tracks(tracks) = self;
-        tracks.iter().enumerate().flat_map(|(channel, notes)| {
-            notes.iter().enumerate().filter_map(move |(note, steps)| {
-                steps
-                    .as_ref()
-                    .map(|steps| (channel as u8, note as u8, steps))
-            })
-        })
-    }
     fn transpose(&mut self, degrees: i32) {
         let Tracks(tracks) = self;
-        for channel in 0..16 {
-            let mut new_notes = [None; 128];
-            for note in 0..128 {
-                if let Some(steps) = tracks[channel][note] {
-                    let intervals = [2, 2, 1, 2, 2, 2, 1];
-                    let octave = note / 12;
-                    let degree = intervals
-                        .iter()
-                        .enumerate()
-                        .take_while({
-                            let mut acc = 0;
-                            move |&(_, &x)| {
-                                acc += x;
-                                acc <= note % 12
-                            }
-                        })
-                        .last()
-                        .map_or(0, |(i, _)| i + 1);
-                    let constrained_note: i32 =
-                        ((octave * 7) as i32 + degree as i32 + degrees).clamp(0, 62); // I did some back-of-the-napkin math.
-                    let octave = constrained_note / 7;
-                    let degree = constrained_note % 7;
-                    let new_note =
-                        12 * octave + intervals.iter().take(degree as usize).sum::<usize>() as i32;
-                    new_notes[new_note as usize] = Some(steps);
-                }
-            }
-            tracks[channel] = new_notes;
-        }
+        *tracks = tracks
+            .iter()
+            .map(|(&(channel, note), &steps)| {
+                let intervals = [2, 2, 1, 2, 2, 2, 1];
+                let octave = note / 12;
+                let degree = intervals
+                    .iter()
+                    .enumerate()
+                    .take_while({
+                        let mut acc = 0;
+                        move |&(_, &x)| {
+                            acc += x;
+                            acc <= note % 12
+                        }
+                    })
+                    .last()
+                    .map_or(0, |(i, _)| i + 1);
+                let constrained_note: i32 =
+                    ((octave * 7) as i32 + degree as i32 + degrees).clamp(0, 62); // I did some back-of-the-napkin math.
+                let octave = constrained_note / 7;
+                let degree = constrained_note % 7;
+                let new_note =
+                    12 * octave + intervals.iter().take(degree as usize).sum::<u8>() as i32;
+                ((channel, new_note as u8), steps)
+            })
+            .collect();
     }
     fn build_seq(&self) -> Vec<(f64, seq::Event)> {
         let mut seq: Vec<_> = self
-            .iter_tracks()
-            .flat_map(|(channel, note, steps)| {
+            .0
+            .iter()
+            .flat_map(|(&(channel, note), steps)| {
                 steps.iter().enumerate().filter_map(move |(i, step)| {
                     step.map(|step| (channel, note, i as f64 / steps.len() as f64, step))
                 })
@@ -370,12 +357,10 @@ struct Ui {
     focus_row: usize,
     focus_step: usize,
 
-    tracks: Box<Tracks>, // Too big for the stack.
+    tracks: Tracks,
     undo: Vec<Tracks>,
     redo: Vec<Tracks>,
 }
-
-// TODO(jack) Separate UI state (with print_* methods) and sequencer state?
 
 impl Ui {
     fn print_header(&self, writer: &mut impl Write) -> std::io::Result<()> {
@@ -400,7 +385,7 @@ impl Ui {
     fn print_tracks(&self, writer: &mut impl Write) -> std::io::Result<()> {
         write!(writer, "{}", termion::cursor::Goto(1, 2))?;
         let mut last_channel = None;
-        for (row, (channel, note, steps)) in self.tracks.iter_tracks().enumerate() {
+        for (row, (&(channel, note), steps)) in self.tracks.0.iter().enumerate() {
             if last_channel
                 .map(|last_channel| last_channel != channel)
                 .unwrap_or(true)
@@ -465,9 +450,10 @@ impl Ui {
         let y = 2;
         if let Some(step) = self
             .tracks
-            .iter_tracks()
+            .0
+            .values()
             .nth(self.focus_row)
-            .and_then(|(_, _, steps)| steps.get(self.focus_step).copied())
+            .and_then(|steps| steps.get(self.focus_step).copied())
             .flatten()
         {
             write!(
@@ -496,7 +482,7 @@ impl Ui {
         Ok(())
     }
     fn print_clock(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        let row = 2 + self.tracks.iter_tracks().count() as u16;
+        let row = 2 + self.tracks.0.iter().count() as u16;
         write!(
             writer,
             "{}{}^\r\n",
@@ -583,7 +569,7 @@ fn main() {
         focus_row: 0,
         focus_step: 0,
 
-        tracks: Box::new(Tracks::default()),
+        tracks: Tracks::default(),
         undo: Vec::new(),
         redo: Vec::new(),
     };
@@ -598,11 +584,11 @@ fn main() {
                 let (time, event) = result.unwrap();
                 match event {
                     seq::Event::Note {channel, note, velocity, length} => {
-                        let mut steps = ui.tracks.0[channel as usize][note as usize].unwrap_or((0..16).map(|_| None).collect());
+                        let mut steps = ui.tracks.0.get(&(channel, note)).copied().unwrap_or((0..16).map(|_| None).collect());
                         let step = (time * steps.len() as f64) as usize;
                         let delay = time % (1.0 / steps.len() as f64);
                         steps[step] = Some(Step{velocity, length, delay});
-                        ui.tracks.0[channel as usize][note as usize] = Some(steps);
+                        ui.tracks.0.insert((channel, note), steps);
                         seq_tx.send(ui.tracks.build_seq()).unwrap();
                     },
                     _ => continue 'running,
@@ -614,16 +600,12 @@ fn main() {
                 match event {
                     Event::Key(Key::Ctrl('c')) => break 'running,
                     Event::Key(Key::Delete) => {
-                        *ui.tracks = Tracks::default();
+                        ui.undo.push(ui.tracks.clone());
+                        ui.tracks = Tracks::default();
                     },
                     Event::Key(Key::Char('Q')) => {
-                        let steps = ui.tracks.0
-                            .iter_mut()
-                            .flat_map(|notes| notes.iter_mut())
-                            .filter_map(|steps| steps.as_mut())
-                            .flat_map(|steps| steps.iter_mut())
-                            .filter_map(|step| step.as_mut());
-                        for step in steps {
+                        ui.undo.push(ui.tracks.clone());
+                        for step in ui.tracks.0.values_mut().flat_map(|steps| steps.iter_mut()).filter_map(|step| step.as_mut()) {
                             step.delay = 0.0;
                         }
                         seq_tx.send(ui.tracks.build_seq()).unwrap();
@@ -635,18 +617,16 @@ fn main() {
                         ui.print_clock(&mut stdout).unwrap();
                     }
                     Event::Key(Key::Char('<')) => {
+                        ui.undo.push(ui.tracks.clone());
                         ui.tracks.transpose(-1);
                         seq_tx.send(ui.tracks.build_seq()).unwrap();
                         ui.print_tracks(&mut stdout).unwrap();
                     }
                     Event::Key(Key::Char('>')) => {
+                        ui.undo.push(ui.tracks.clone());
                         ui.tracks.transpose(1);
                         seq_tx.send(ui.tracks.build_seq()).unwrap();
                         ui.print_tracks(&mut stdout).unwrap();
-                        // TODO(jack)
-                        // https://old.reddit.com/r/rust/comments/n2jasd/question_copy_big_value_from_box_into_vec_without/?
-                        // https://stackoverflow.com/questions/67347376/copy-big-value-from-box-into-vec-without-blowing-the-stack
-                        // ui.undo.push(*ui.tracks)
                     }
                     Event::Key(Key::Char('r')) => {
                         ui.record = !ui.record;
@@ -654,26 +634,43 @@ fn main() {
                         ui.print_header(&mut stdout).unwrap();
                     }
                     Event::Key(Key::Char('h')) => {
-                        let row = ui.tracks.iter_tracks().nth(ui.focus_row);
-                        if let Some((_, _, steps)) = row {
+                        if let Some(steps) = ui.tracks.0.values().nth(ui.focus_row) {
                             ui.focus_step = ui.focus_step.checked_sub(1).unwrap_or(steps.len() - 1);
                         }
                         ui.print_tracks(&mut stdout).unwrap();
                     }
                     Event::Key(Key::Char('l')) => {
-                        let row = ui.tracks.iter_tracks().nth(ui.focus_row);
-                        if let Some((_, _, steps)) = row {
+                        if let Some(steps) = ui.tracks.0.values().nth(ui.focus_row) {
                             ui.focus_step = (ui.focus_step + 1) % steps.len();
                         }
                         ui.print_tracks(&mut stdout).unwrap();
                     }
                     Event::Key(Key::Char('k')) => {
-                        ui.focus_row = ui.focus_row.checked_sub(1).unwrap_or_else(|| ui.tracks.iter_tracks().count() - 1);
+                        ui.focus_row = ui.focus_row.checked_sub(1).unwrap_or_else(|| ui.tracks.0.iter().count() - 1);
                         ui.print_tracks(&mut stdout).unwrap();
                     }
                     Event::Key(Key::Char('j')) => {
-                        ui.focus_row = (ui.focus_row + 1) % ui.tracks.iter_tracks().count();
-                        ui.print_tracks(&mut stdout).unwrap();
+                        let rows = ui.tracks.0.iter().count();
+                        if rows > 0 {
+                            ui.focus_row = (ui.focus_row + 1) % rows;
+                            ui.print_tracks(&mut stdout).unwrap();
+                        }
+                    }
+                    Event::Key(Key::Char('u')) => {
+                        if let Some(tracks) = ui.undo.pop() {
+                            let tracks = replace(&mut ui.tracks, tracks);
+                            ui.redo.push(tracks);
+                            ui.print_tracks(&mut stdout).unwrap();
+                            seq_tx.send(ui.tracks.build_seq()).unwrap();
+                        }
+                    }
+                    Event::Key(Key::Ctrl('r')) => {
+                        if let Some(tracks) = ui.redo.pop() {
+                            let tracks = replace(&mut ui.tracks, tracks);
+                            ui.undo.push(tracks);
+                            ui.print_tracks(&mut stdout).unwrap();
+                            seq_tx.send(ui.tracks.build_seq()).unwrap();
+                        }
                     }
                     _ => (),
                 }

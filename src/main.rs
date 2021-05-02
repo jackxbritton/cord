@@ -3,9 +3,9 @@
 mod midi;
 mod seq;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
-use std::io::{stdin, stdout, Write};
+use std::io::{stdin, stdout};
 use std::mem::replace;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::spawn;
@@ -46,8 +46,8 @@ struct ProcessHandler<'a> {
     midi_in_port: jack::Port<jack::MidiIn>,
     midi_out_port: jack::Port<jack::MidiOut>,
 
-    held_incoming_midi_notes: [[Option<(f64, f64)>; 128]; 16],
-    held_outgoing_midi_notes: [[i32; 128]; 16],
+    held_incoming_midi_notes: HashMap<(Channel, Note), (f64, f64)>,
+    held_outgoing_midi_notes: HashMap<(Channel, Note), i32>,
 
     midi_event_queue: Vec<(f64, midi::Event)>,
 
@@ -92,21 +92,14 @@ impl<'a> jack::ProcessHandler for ProcessHandler<'a> {
 
         let mut writer = midi_out_port.writer(process_scope);
         if flush.load(Ordering::Relaxed) {
-            for (channel, notes) in held_outgoing_midi_notes.iter_mut().enumerate() {
-                for (note, count) in notes.iter_mut().enumerate() {
-                    for _ in 0..*count {
-                        writer
-                            .write(&jack::RawMidi {
-                                time: 0,
-                                bytes: midi::Event::NoteOff {
-                                    channel: channel as u8,
-                                    note: note as u8,
-                                }
-                                .to_bytes()
-                                .as_slice(),
-                            })
-                            .unwrap();
-                    }
+            for (&(channel, note), count) in held_outgoing_midi_notes {
+                for _ in 0..*count {
+                    writer
+                        .write(&jack::RawMidi {
+                            time: 0,
+                            bytes: midi::Event::NoteOff { channel, note }.to_bytes().as_slice(),
+                        })
+                        .unwrap();
                     *count = 0;
                 }
             }
@@ -131,7 +124,7 @@ impl<'a> jack::ProcessHandler for ProcessHandler<'a> {
                     match event {
                         midi::Event::NoteOff { channel, note } => {
                             if let Some((start, velocity)) =
-                                held_incoming_midi_notes[channel as usize][note as usize].take()
+                                held_incoming_midi_notes.remove(&(channel, note))
                             {
                                 seq_event_tx
                                     .send((
@@ -151,8 +144,8 @@ impl<'a> jack::ProcessHandler for ProcessHandler<'a> {
                             note,
                             velocity,
                         } => {
-                            held_incoming_midi_notes[channel as usize][note as usize] =
-                                Some((time, (velocity as f64 - 1.0) / 126.0));
+                            held_incoming_midi_notes
+                                .insert((channel, note), (time, (velocity as f64 - 1.0) / 126.0));
                         }
                         midi::Event::ControlChange {
                             channel,
@@ -248,10 +241,10 @@ impl<'a> jack::ProcessHandler for ProcessHandler<'a> {
                 .unwrap();
             match event {
                 midi::Event::NoteOff { channel, note } => {
-                    held_outgoing_midi_notes[channel as usize][note as usize] -= 1
+                    *held_outgoing_midi_notes.entry((channel, note)).or_insert(0) -= 1;
                 }
                 midi::Event::NoteOn { channel, note, .. } => {
-                    held_outgoing_midi_notes[channel as usize][note as usize] += 1
+                    *held_outgoing_midi_notes.entry((channel, note)).or_insert(0) += 1;
                 }
                 _ => (),
             }
@@ -360,42 +353,169 @@ struct Ui {
     tracks: Tracks,
     undo: Vec<Tracks>,
     redo: Vec<Tracks>,
+
+    seq_tx: Sender<Vec<(f64, seq::Event)>>,
 }
 
 impl Ui {
-    fn print_header(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        write!(
-            writer,
+    fn push_tracks(&mut self) {
+        self.undo.push(self.tracks.clone());
+        self.redo.clear();
+    }
+    fn step(&mut self, event: Event) -> bool {
+        match event {
+            Event::Key(Key::Ctrl('c')) => return false,
+            Event::Key(Key::Backspace) => {
+                self.push_tracks();
+                if let Some(steps) = self.tracks.0.values_mut().nth(self.focus_row) {
+                    for step in steps {
+                        *step = None;
+                    }
+                }
+                self.seq_tx.send(self.tracks.build_seq()).unwrap();
+                self.print_tracks();
+            }
+            Event::Key(Key::Delete) => {
+                self.push_tracks();
+                if let Some(key) = self.tracks.0.keys().nth(self.focus_row).copied() {
+                    self.tracks.0.remove(&key);
+                    self.focus_row = self.focus_row.min(self.tracks.0.len() - 1)
+                }
+                self.seq_tx.send(self.tracks.build_seq()).unwrap();
+                print!("{}", termion::clear::All);
+                self.print_header();
+                self.print_tracks();
+                self.print_clock();
+            }
+            Event::Key(Key::Char('Q')) => {
+                self.push_tracks();
+                for step in self
+                    .tracks
+                    .0
+                    .values_mut()
+                    .flat_map(|steps| steps.iter_mut())
+                    .filter_map(|step| step.as_mut())
+                {
+                    step.delay = 0.0;
+                }
+                self.seq_tx.send(self.tracks.build_seq()).unwrap();
+            }
+            Event::Key(Key::Ctrl('l')) => {
+                print!("{}", termion::clear::All);
+                self.print_header();
+                self.print_tracks();
+                self.print_clock();
+            }
+            Event::Key(Key::Char('<')) => {
+                self.push_tracks();
+                self.tracks.transpose(-1);
+                self.seq_tx.send(self.tracks.build_seq()).unwrap();
+                self.print_tracks();
+            }
+            Event::Key(Key::Char('>')) => {
+                self.push_tracks();
+                self.tracks.transpose(1);
+                self.seq_tx.send(self.tracks.build_seq()).unwrap();
+                self.print_tracks();
+            }
+            Event::Key(Key::Char('g')) => {
+                self.push_tracks();
+                if let Some(steps) = self.tracks.0.values_mut().nth(self.focus_row) {
+                    let n = steps.len();
+                    for (i, step) in steps.iter_mut().enumerate() {
+                        if let Some(step) = step {
+                            step.velocity = i as f64 / n as f64;
+                        }
+                    }
+                }
+                self.seq_tx.send(self.tracks.build_seq()).unwrap();
+                self.print_tracks();
+            }
+            Event::Key(Key::Char('r')) => {
+                self.record = !self.record;
+                RECORD.store(self.record, Ordering::Relaxed);
+                self.print_header();
+            }
+            Event::Key(Key::Char('h')) => {
+                if let Some(steps) = self.tracks.0.values().nth(self.focus_row) {
+                    self.focus_step = self.focus_step.checked_sub(1).unwrap_or(steps.len() - 1);
+                }
+                self.print_tracks();
+            }
+            Event::Key(Key::Char('l')) => {
+                if let Some(steps) = self.tracks.0.values().nth(self.focus_row) {
+                    self.focus_step = (self.focus_step + 1) % steps.len();
+                }
+                self.print_tracks();
+            }
+            Event::Key(Key::Char('k')) => {
+                self.focus_row = self
+                    .focus_row
+                    .checked_sub(1)
+                    .unwrap_or_else(|| self.tracks.0.len() - 1);
+                self.print_tracks();
+            }
+            Event::Key(Key::Char('j')) => {
+                let rows = self.tracks.0.len();
+                if rows > 0 {
+                    self.focus_row = (self.focus_row + 1) % rows;
+                    self.print_tracks();
+                }
+            }
+            Event::Key(Key::Char('u')) => {
+                if let Some(tracks) = self.undo.pop() {
+                    self.redo.push(replace(&mut self.tracks, tracks));
+                    self.seq_tx.send(self.tracks.build_seq()).unwrap();
+                    print!("{}", termion::clear::All);
+                    self.print_header();
+                    self.print_tracks();
+                    self.print_clock();
+                }
+            }
+            Event::Key(Key::Ctrl('r')) => {
+                if let Some(tracks) = self.redo.pop() {
+                    self.undo.push(replace(&mut self.tracks, tracks));
+                    self.seq_tx.send(self.tracks.build_seq()).unwrap();
+                    print!("{}", termion::clear::All);
+                    self.print_header();
+                    self.print_tracks();
+                    self.print_clock();
+                }
+            }
+            _ => (),
+        };
+        true
+    }
+    fn print_header(&self) {
+        print!(
             "{}{}",
             termion::cursor::Goto(1, 1),
             termion::clear::CurrentLine
-        )?;
+        );
         if self.record {
-            write!(
-                writer,
+            print!(
                 "{}{}[record]{}{}\r\n",
                 termion::color::Bg(termion::color::Red),
                 termion::color::Fg(termion::color::Black),
                 termion::color::Bg(termion::color::Reset),
                 termion::color::Fg(termion::color::Reset),
-            )?;
+            );
         }
-        Ok(())
     }
-    fn print_tracks(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        write!(writer, "{}", termion::cursor::Goto(1, 2))?;
+    fn print_tracks(&self) {
+        print!("{}", termion::cursor::Goto(1, 2));
         let mut last_channel = None;
         for (row, (&(channel, note), steps)) in self.tracks.0.iter().enumerate() {
             if last_channel
                 .map(|last_channel| last_channel != channel)
                 .unwrap_or(true)
             {
-                write!(writer, "c{:02} ", channel)?;
+                print!("c{:02} ", channel);
                 last_channel = Some(channel);
             } else {
-                write!(writer, "    ")?;
+                print!("    ");
             }
-            write!(writer, "n{:03} |", note)?;
+            print!("n{:03} |", note);
             for (i, (spaces, step)) in euclid(steps.len(), MAX_STEPS, 0)
                 .filter_map({
                     let mut acc = 1;
@@ -415,34 +535,31 @@ impl Ui {
             {
                 if row == self.focus_row {
                     if i == self.focus_step {
-                        write!(
-                            writer,
+                        print!(
                             "{}{}",
                             termion::color::Bg(termion::color::Red),
                             termion::color::Fg(termion::color::Black),
-                        )?;
+                        );
                     } else {
-                        write!(
-                            writer,
+                        print!(
                             "{}{}",
                             termion::color::Bg(termion::color::Blue),
                             termion::color::Fg(termion::color::Black),
-                        )?;
+                        );
                     }
                 }
                 for _ in 0..spaces {
-                    write!(writer, " ")?;
+                    print!(" ");
                 }
                 let ch = if step.is_some() { "." } else { " " };
-                write!(
-                    writer,
+                print!(
                     "{}{}{}",
                     ch,
                     termion::color::Bg(termion::color::Reset),
                     termion::color::Fg(termion::color::Reset),
-                )?;
+                );
             }
-            write!(writer, "|\r\n")?;
+            print!("|\r\n");
         }
 
         // Print step information to the right.
@@ -456,8 +573,7 @@ impl Ui {
             .and_then(|steps| steps.get(self.focus_step).copied())
             .flatten()
         {
-            write!(
-                writer,
+            print!(
                 "{}v={}{}l={}{}d={}",
                 termion::cursor::Goto(x, y),
                 step.velocity,
@@ -465,10 +581,9 @@ impl Ui {
                 step.length,
                 termion::cursor::Goto(x, y + 2),
                 step.delay,
-            )?;
+            );
         } else {
-            write!(
-                writer,
+            print!(
                 "{}{}{}{}{}{}",
                 termion::cursor::Goto(x, y),
                 termion::clear::UntilNewline,
@@ -476,20 +591,16 @@ impl Ui {
                 termion::clear::UntilNewline,
                 termion::cursor::Goto(x, y + 2),
                 termion::clear::UntilNewline,
-            )?;
+            );
         }
-
-        Ok(())
     }
-    fn print_clock(&self, writer: &mut impl Write) -> std::io::Result<()> {
-        let row = 2 + self.tracks.0.iter().count() as u16;
-        write!(
-            writer,
+    fn print_clock(&self) {
+        let row = 2 + self.tracks.0.len() as u16;
+        print!(
             "{}{}^\r\n",
             termion::cursor::Goto(10 + self.clock, row),
             termion::clear::CurrentLine,
-        )?;
-        Ok(())
+        );
     }
 }
 
@@ -516,8 +627,8 @@ fn main() {
             ProcessHandler {
                 midi_in_port,
                 midi_out_port,
-                held_incoming_midi_notes: [[None; 128]; 16],
-                held_outgoing_midi_notes: [[0; 128]; 16],
+                held_incoming_midi_notes: HashMap::with_capacity(16 * 128),
+                held_outgoing_midi_notes: HashMap::with_capacity(16 * 128),
                 midi_event_queue: Vec::with_capacity(64),
                 clock: 0.0,
                 seq: Vec::new(),
@@ -547,7 +658,7 @@ fn main() {
         default_hook(info);
     }));
     let stdin = stdin();
-    let mut stdout = {
+    let _stdout = {
         let stdout = stdout().into_raw_mode().unwrap();
         let stdout = AlternateScreen::from(stdout);
         let stdout = MouseTerminal::from(stdout);
@@ -572,10 +683,11 @@ fn main() {
         tracks: Tracks::default(),
         undo: Vec::new(),
         redo: Vec::new(),
-    };
-    seq_tx.send(ui.tracks.build_seq()).unwrap();
 
-    ui.print_header(&mut stdout).unwrap();
+        seq_tx,
+    };
+
+    ui.print_header();
 
     'running: loop {
         select! {
@@ -584,95 +696,22 @@ fn main() {
                 let (time, event) = result.unwrap();
                 match event {
                     seq::Event::Note {channel, note, velocity, length} => {
+                        ui.undo.push(ui.tracks.clone());
                         let mut steps = ui.tracks.0.get(&(channel, note)).copied().unwrap_or((0..16).map(|_| None).collect());
                         let step = (time * steps.len() as f64) as usize;
                         let delay = time % (1.0 / steps.len() as f64);
                         steps[step] = Some(Step{velocity, length, delay});
                         ui.tracks.0.insert((channel, note), steps);
-                        seq_tx.send(ui.tracks.build_seq()).unwrap();
+                        ui.seq_tx.send(ui.tracks.build_seq()).unwrap();
                     },
                     _ => continue 'running,
                 }
-                ui.print_tracks(&mut stdout).unwrap();
+                ui.print_tracks();
             },
             recv(event_rx) -> result => {
                 let event = result.unwrap();
-                match event {
-                    Event::Key(Key::Ctrl('c')) => break 'running,
-                    Event::Key(Key::Delete) => {
-                        ui.undo.push(ui.tracks.clone());
-                        ui.tracks = Tracks::default();
-                    },
-                    Event::Key(Key::Char('Q')) => {
-                        ui.undo.push(ui.tracks.clone());
-                        for step in ui.tracks.0.values_mut().flat_map(|steps| steps.iter_mut()).filter_map(|step| step.as_mut()) {
-                            step.delay = 0.0;
-                        }
-                        seq_tx.send(ui.tracks.build_seq()).unwrap();
-                    },
-                    Event::Key(Key::Ctrl('l')) => {
-                        write!(stdout, "{}", termion::clear::All).unwrap();
-                        ui.print_header(&mut stdout).unwrap();
-                        ui.print_tracks(&mut stdout).unwrap();
-                        ui.print_clock(&mut stdout).unwrap();
-                    }
-                    Event::Key(Key::Char('<')) => {
-                        ui.undo.push(ui.tracks.clone());
-                        ui.tracks.transpose(-1);
-                        seq_tx.send(ui.tracks.build_seq()).unwrap();
-                        ui.print_tracks(&mut stdout).unwrap();
-                    }
-                    Event::Key(Key::Char('>')) => {
-                        ui.undo.push(ui.tracks.clone());
-                        ui.tracks.transpose(1);
-                        seq_tx.send(ui.tracks.build_seq()).unwrap();
-                        ui.print_tracks(&mut stdout).unwrap();
-                    }
-                    Event::Key(Key::Char('r')) => {
-                        ui.record = !ui.record;
-                        RECORD.store(ui.record, Ordering::Relaxed);
-                        ui.print_header(&mut stdout).unwrap();
-                    }
-                    Event::Key(Key::Char('h')) => {
-                        if let Some(steps) = ui.tracks.0.values().nth(ui.focus_row) {
-                            ui.focus_step = ui.focus_step.checked_sub(1).unwrap_or(steps.len() - 1);
-                        }
-                        ui.print_tracks(&mut stdout).unwrap();
-                    }
-                    Event::Key(Key::Char('l')) => {
-                        if let Some(steps) = ui.tracks.0.values().nth(ui.focus_row) {
-                            ui.focus_step = (ui.focus_step + 1) % steps.len();
-                        }
-                        ui.print_tracks(&mut stdout).unwrap();
-                    }
-                    Event::Key(Key::Char('k')) => {
-                        ui.focus_row = ui.focus_row.checked_sub(1).unwrap_or_else(|| ui.tracks.0.iter().count() - 1);
-                        ui.print_tracks(&mut stdout).unwrap();
-                    }
-                    Event::Key(Key::Char('j')) => {
-                        let rows = ui.tracks.0.iter().count();
-                        if rows > 0 {
-                            ui.focus_row = (ui.focus_row + 1) % rows;
-                            ui.print_tracks(&mut stdout).unwrap();
-                        }
-                    }
-                    Event::Key(Key::Char('u')) => {
-                        if let Some(tracks) = ui.undo.pop() {
-                            let tracks = replace(&mut ui.tracks, tracks);
-                            ui.redo.push(tracks);
-                            ui.print_tracks(&mut stdout).unwrap();
-                            seq_tx.send(ui.tracks.build_seq()).unwrap();
-                        }
-                    }
-                    Event::Key(Key::Ctrl('r')) => {
-                        if let Some(tracks) = ui.redo.pop() {
-                            let tracks = replace(&mut ui.tracks, tracks);
-                            ui.undo.push(tracks);
-                            ui.print_tracks(&mut stdout).unwrap();
-                            seq_tx.send(ui.tracks.build_seq()).unwrap();
-                        }
-                    }
-                    _ => (),
+                if !ui.step(event) {
+                    break 'running;
                 }
             },
             recv(state_rx) -> result => {
@@ -680,7 +719,7 @@ fn main() {
                 let step = (clock * 32 as f64) as u16;
                 if ui.clock != step {
                     ui.clock = step;
-                    ui.print_clock(&mut stdout).unwrap();
+                    ui.print_clock();
                 }
             }
         }

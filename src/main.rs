@@ -6,6 +6,7 @@ mod seq;
 use std::collections::{BTreeMap, HashMap};
 use std::default::Default;
 use std::io::{stdin, stdout};
+use std::iter::{once, repeat};
 use std::mem::replace;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::spawn;
@@ -271,39 +272,44 @@ struct Step {
 const MAX_STEPS: usize = 32;
 type Track = ArrayVec<[Option<Step>; MAX_STEPS]>;
 
-type Channel = u8;
-type Note = u8;
-
 #[derive(Clone, Default)]
-struct Tracks(BTreeMap<(Channel, Note), Track>);
+struct Tracks(BTreeMap<Channel, BTreeMap<Note, Track>>);
 
 impl Tracks {
     fn transpose(&mut self, degrees: i32) {
         let Tracks(tracks) = self;
         *tracks = tracks
             .iter()
-            .map(|(&(channel, note), &steps)| {
-                let intervals = [2, 2, 1, 2, 2, 2, 1];
-                let octave = note / 12;
-                let degree = intervals
-                    .iter()
-                    .enumerate()
-                    .take_while({
-                        let mut acc = 0;
-                        move |&(_, &x)| {
-                            acc += x;
-                            acc <= note % 12
-                        }
-                    })
-                    .last()
-                    .map_or(0, |(i, _)| i + 1);
-                let constrained_note: i32 =
-                    ((octave * 7) as i32 + degree as i32 + degrees).clamp(0, 62); // I did some back-of-the-napkin math.
-                let octave = constrained_note / 7;
-                let degree = constrained_note % 7;
-                let new_note =
-                    12 * octave + intervals.iter().take(degree as usize).sum::<u8>() as i32;
-                ((channel, new_note as u8), steps)
+            .map(|(&channel, notes)| {
+                (
+                    channel,
+                    notes
+                        .iter()
+                        .map(|(&note, &steps)| {
+                            let intervals = [2, 2, 1, 2, 2, 2, 1];
+                            let octave = note / 12;
+                            let degree = intervals
+                                .iter()
+                                .enumerate()
+                                .take_while({
+                                    let mut acc = 0;
+                                    move |&(_, &x)| {
+                                        acc += x;
+                                        acc <= note % 12
+                                    }
+                                })
+                                .last()
+                                .map_or(0, |(i, _)| i + 1);
+                            let constrained_note: i32 =
+                                ((octave * 7) as i32 + degree as i32 + degrees).clamp(0, 62); // I did some back-of-the-napkin math.
+                            let octave = constrained_note / 7;
+                            let degree = constrained_note % 7;
+                            let new_note = 12 * octave
+                                + intervals.iter().take(degree as usize).sum::<u8>() as i32;
+                            (new_note as u8, steps)
+                        })
+                        .collect(),
+                )
             })
             .collect();
     }
@@ -311,7 +317,12 @@ impl Tracks {
         let mut seq: Vec<_> = self
             .0
             .iter()
-            .flat_map(|(&(channel, note), steps)| {
+            .flat_map(|(&channel, notes)| {
+                notes
+                    .iter()
+                    .map(move |(&note, steps)| (channel, note, steps))
+            })
+            .flat_map(|(channel, note, steps)| {
                 steps.iter().enumerate().filter_map(move |(i, step)| {
                     step.map(|step| (channel, note, i as f64 / steps.len() as f64, step))
                 })
@@ -344,11 +355,31 @@ impl Tracks {
     }
 }
 
+// TODO(jack) Focus mode is either step, note, or channel.
+// Operations should then apply to every step in the focus.
+
+type Channel = u8;
+type Note = u8;
+
+#[derive(Debug, Copy, Clone)]
+enum Focus {
+    Channel(Channel),
+    Note {
+        channel: Channel,
+        note: Note,
+    },
+    Step {
+        channel: Channel,
+        note: Note,
+        step: usize,
+    },
+}
+
 struct Ui {
     record: bool,
     clock: u16,
-    focus_row: usize,
-    focus_step: usize,
+
+    focus: Focus,
 
     tracks: Tracks,
     undo: Vec<Tracks>,
@@ -359,44 +390,165 @@ struct Ui {
 
 impl Ui {
     fn push_tracks(&mut self) {
+        // TODO(jack) Action enum to log messages of what's being done / undone?
         self.undo.push(self.tracks.clone());
         self.redo.clear();
+    }
+    fn move_left(&mut self) {
+        match &mut self.focus {
+            Focus::Step {
+                channel,
+                note,
+                step,
+            } => {
+                if let Some(n) = self
+                    .tracks
+                    .0
+                    .get(channel)
+                    .and_then(|notes| notes.get(note))
+                    .map(|steps| steps.len())
+                    .filter(|&n| n > 0)
+                {
+                    *step = step.checked_sub(1).unwrap_or(n - 1);
+                    self.print_tracks();
+                }
+            }
+            _ => (),
+        };
+    }
+    fn move_right(&mut self) {
+        match &mut self.focus {
+            Focus::Step {
+                channel,
+                note,
+                step,
+            } => {
+                if let Some(n) = self
+                    .tracks
+                    .0
+                    .get(channel)
+                    .and_then(|notes| notes.get(note))
+                    .map(|steps| steps.len())
+                    .filter(|&n| n > 0)
+                {
+                    *step = (*step + 1) % n;
+                    self.print_tracks();
+                }
+            }
+            _ => (),
+        };
+        self.print_tracks();
+    }
+    fn move_down(&mut self) {
+        match &mut self.focus {
+            Focus::Channel(channel) => {
+                if let Some(&c) = self.tracks.0.keys().filter(|&c| c < channel).last() {
+                    *channel = c;
+                }
+            }
+            Focus::Note { channel, note } | Focus::Step { channel, note, .. } => {
+                if let Some((c, n)) = self
+                    .tracks
+                    .0
+                    .iter()
+                    .flat_map(|(&channel, notes)| notes.keys().map(move |&note| (channel, note)))
+                    .filter(|(c, n)| (c, n) < (channel, note))
+                    .last()
+                {
+                    *channel = c;
+                    *note = n;
+                }
+            }
+        };
+        self.print_tracks();
+    }
+    fn move_up(&mut self) {
+        match &mut self.focus {
+            Focus::Channel(channel) => {
+                if let Some(&c) = self.tracks.0.keys().filter(|&c| c > channel).next() {
+                    *channel = c;
+                }
+            }
+            Focus::Note { channel, note } | Focus::Step { channel, note, .. } => {
+                if let Some((c, n)) = self
+                    .tracks
+                    .0
+                    .iter()
+                    .flat_map(|(&channel, notes)| notes.keys().map(move |&note| (channel, note)))
+                    .filter(|(c, n)| (c, n) > (channel, note))
+                    .next()
+                {
+                    *channel = c;
+                    *note = n;
+                }
+            }
+        };
+        self.print_tracks();
     }
     fn step(&mut self, event: Event) -> bool {
         match event {
             Event::Key(Key::Ctrl('c')) => return false,
             Event::Key(Key::Backspace) => {
                 self.push_tracks();
-                if let Some(steps) = self.tracks.0.values_mut().nth(self.focus_row) {
-                    for step in steps {
-                        *step = None;
+                match self.focus {
+                    Focus::Channel(channel) => {
+                        self.tracks.0.remove(&channel);
+                    }
+                    Focus::Note { channel, note } | Focus::Step { channel, note, .. } => {
+                        if let Some(notes) = self.tracks.0.get_mut(&channel) {
+                            notes.remove(&note);
+                            if notes.is_empty() {
+                                self.tracks.0.remove(&channel);
+                            }
+                        }
                     }
                 }
+                self.move_down();
                 self.seq_tx.send(self.tracks.build_seq()).unwrap();
                 self.print_tracks();
             }
-            Event::Key(Key::Delete) => {
+            Event::Key(Key::Char('q')) => {
                 self.push_tracks();
-                if let Some(key) = self.tracks.0.keys().nth(self.focus_row).copied() {
-                    self.tracks.0.remove(&key);
-                    self.focus_row = self.focus_row.min(self.tracks.0.len() - 1)
-                }
-                self.seq_tx.send(self.tracks.build_seq()).unwrap();
-                print!("{}", termion::clear::All);
-                self.print_header();
-                self.print_tracks();
-                self.print_clock();
-            }
-            Event::Key(Key::Char('Q')) => {
-                self.push_tracks();
-                for step in self
-                    .tracks
-                    .0
-                    .values_mut()
-                    .flat_map(|steps| steps.iter_mut())
-                    .filter_map(|step| step.as_mut())
-                {
-                    step.delay = 0.0;
+                // TODO(jack) This code is clearly very redundant. How can I refactor?
+                // If I had a flat array to work with, I could use slices / slice iterators..
+                match self.focus {
+                    Focus::Channel(channel) => {
+                        for notes in self.tracks.0.get_mut(&channel) {
+                            for steps in notes.values_mut() {
+                                for step in steps {
+                                    if let Some(step) = step {
+                                        step.delay = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Focus::Note { channel, note } => {
+                        for notes in self.tracks.0.get_mut(&channel) {
+                            for steps in notes.get_mut(&note) {
+                                for step in steps {
+                                    if let Some(step) = step {
+                                        step.delay = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Focus::Step {
+                        channel,
+                        note,
+                        step,
+                    } => {
+                        for notes in self.tracks.0.get_mut(&channel) {
+                            for steps in notes.get_mut(&note) {
+                                for step in steps.get_mut(step) {
+                                    if let Some(step) = step {
+                                        step.delay = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 self.seq_tx.send(self.tracks.build_seq()).unwrap();
             }
@@ -420,11 +572,52 @@ impl Ui {
             }
             Event::Key(Key::Char('g')) => {
                 self.push_tracks();
+                /*
                 if let Some(steps) = self.tracks.0.values_mut().nth(self.focus_row) {
                     let n = steps.len();
                     for (i, step) in steps.iter_mut().enumerate() {
                         if let Some(step) = step {
                             step.velocity = i as f64 / n as f64;
+                        }
+                    }
+                }
+                */
+                match self.focus {
+                    Focus::Channel(channel) => {
+                        for notes in self.tracks.0.get_mut(&channel) {
+                            for steps in notes.values_mut() {
+                                for step in steps {
+                                    if let Some(step) = step {
+                                        step.delay = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Focus::Note { channel, note } => {
+                        for notes in self.tracks.0.get_mut(&channel) {
+                            for steps in notes.get_mut(&note) {
+                                for step in steps {
+                                    if let Some(step) = step {
+                                        step.delay = 0.0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Focus::Step {
+                        channel,
+                        note,
+                        step,
+                    } => {
+                        for notes in self.tracks.0.get_mut(&channel) {
+                            for steps in notes.get_mut(&note) {
+                                for step in steps.get_mut(step) {
+                                    if let Some(step) = step {
+                                        step.delay = 0.0;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -436,32 +629,61 @@ impl Ui {
                 RECORD.store(self.record, Ordering::Relaxed);
                 self.print_header();
             }
-            Event::Key(Key::Char('h')) => {
-                if let Some(steps) = self.tracks.0.values().nth(self.focus_row) {
-                    self.focus_step = self.focus_step.checked_sub(1).unwrap_or(steps.len() - 1);
-                }
+            Event::Key(Key::Char('c')) => {
+                self.focus = match self.focus {
+                    Focus::Channel(channel)
+                    | Focus::Note { channel, .. }
+                    | Focus::Step { channel, .. } => Focus::Channel(channel),
+                };
+                self.print_header();
                 self.print_tracks();
             }
-            Event::Key(Key::Char('l')) => {
-                if let Some(steps) = self.tracks.0.values().nth(self.focus_row) {
-                    self.focus_step = (self.focus_step + 1) % steps.len();
-                }
+            Event::Key(Key::Char('n')) => {
+                self.focus = match self.focus {
+                    Focus::Channel(channel) => Focus::Note {
+                        channel,
+                        note: self
+                            .tracks
+                            .0
+                            .get(&channel)
+                            .and_then(|notes| notes.keys().next())
+                            .copied()
+                            .unwrap_or(0),
+                    },
+                    Focus::Note { channel, note } | Focus::Step { channel, note, .. } => {
+                        Focus::Note { channel, note }
+                    }
+                };
+                self.print_header();
                 self.print_tracks();
             }
-            Event::Key(Key::Char('k')) => {
-                self.focus_row = self
-                    .focus_row
-                    .checked_sub(1)
-                    .unwrap_or_else(|| self.tracks.0.len() - 1);
+            Event::Key(Key::Char('s')) => {
+                self.focus = match self.focus {
+                    Focus::Channel(channel) => Focus::Step {
+                        channel,
+                        note: self
+                            .tracks
+                            .0
+                            .get(&channel)
+                            .and_then(|notes| notes.keys().next())
+                            .copied()
+                            .unwrap_or(0),
+                        step: 0,
+                    },
+                    Focus::Note { channel, note } => Focus::Step {
+                        channel,
+                        note,
+                        step: 0,
+                    },
+                    step => step,
+                };
+                self.print_header();
                 self.print_tracks();
             }
-            Event::Key(Key::Char('j')) => {
-                let rows = self.tracks.0.len();
-                if rows > 0 {
-                    self.focus_row = (self.focus_row + 1) % rows;
-                    self.print_tracks();
-                }
-            }
+            Event::Key(Key::Char('h')) => self.move_left(),
+            Event::Key(Key::Char('l')) => self.move_right(),
+            Event::Key(Key::Char('k')) => self.move_down(),
+            Event::Key(Key::Char('j')) => self.move_up(),
             Event::Key(Key::Char('u')) => {
                 if let Some(tracks) = self.undo.pop() {
                     self.redo.push(replace(&mut self.tracks, tracks));
@@ -492,6 +714,18 @@ impl Ui {
             termion::cursor::Goto(1, 1),
             termion::clear::CurrentLine
         );
+        print!(
+            "{}{}[{}]{}{}",
+            termion::color::Bg(termion::color::Blue),
+            termion::color::Fg(termion::color::Black),
+            match self.focus {
+                Focus::Channel { .. } => "focus channel",
+                Focus::Note { .. } => "focus note",
+                Focus::Step { .. } => "focus step",
+            },
+            termion::color::Bg(termion::color::Reset),
+            termion::color::Fg(termion::color::Reset),
+        );
         if self.record {
             print!(
                 "{}{}[record]{}{}\r\n",
@@ -504,98 +738,144 @@ impl Ui {
     }
     fn print_tracks(&self) {
         print!("{}", termion::cursor::Goto(1, 2));
-        let mut last_channel = None;
-        for (row, (&(channel, note), steps)) in self.tracks.0.iter().enumerate() {
-            if last_channel
-                .map(|last_channel| last_channel != channel)
-                .unwrap_or(true)
-            {
-                print!("c{:02} ", channel);
-                last_channel = Some(channel);
-            } else {
-                print!("    ");
-            }
-            print!("n{:03} |", note);
-            for (i, (spaces, step)) in euclid(steps.len(), MAX_STEPS, 0)
-                .filter_map({
-                    let mut acc = 1;
-                    move |pulse| {
-                        if pulse {
-                            let spaces = acc;
-                            acc = 0;
-                            Some(spaces)
-                        } else {
-                            acc += 1;
-                            None
-                        }
-                    }
-                })
-                .zip(steps)
-                .enumerate()
-            {
-                if row == self.focus_row {
-                    if i == self.focus_step {
+        for (&channel, notes) in &self.tracks.0 {
+            for ((&note, steps), first) in notes.iter().zip(once(true).chain(repeat(false))) {
+                if first {
+                    let highlight = match self.focus {
+                        Focus::Channel(c) if c == channel => true,
+                        _ => false,
+                    };
+                    if highlight {
                         print!(
-                            "{}{}",
-                            termion::color::Bg(termion::color::Red),
+                            "{}{}c{:02}{}{} ",
+                            termion::color::Bg(termion::color::Blue),
                             termion::color::Fg(termion::color::Black),
+                            channel,
+                            termion::color::Bg(termion::color::Reset),
+                            termion::color::Fg(termion::color::Reset),
                         );
                     } else {
+                        print!("c{:02} ", channel);
+                    }
+                } else {
+                    print!("    ");
+                }
+                let highlight = match self.focus {
+                    Focus::Note {
+                        channel: c,
+                        note: n,
+                    } if (c, n) == (channel, note) => true,
+                    _ => false,
+                };
+                if highlight {
+                    print!(
+                        "{}{}n{:03}{}{} |",
+                        termion::color::Bg(termion::color::Blue),
+                        termion::color::Fg(termion::color::Black),
+                        note,
+                        termion::color::Bg(termion::color::Reset),
+                        termion::color::Fg(termion::color::Reset),
+                    );
+                } else {
+                    print!("n{:03} |", note);
+                }
+                for (i, (spaces, step)) in euclid(steps.len(), MAX_STEPS, 0)
+                    .filter_map({
+                        let mut acc = 1;
+                        move |pulse| {
+                            if pulse {
+                                let spaces = acc;
+                                acc = 0;
+                                Some(spaces)
+                            } else {
+                                acc += 1;
+                                None
+                            }
+                        }
+                    })
+                    .zip(steps)
+                    .enumerate()
+                {
+                    let highlight = match self.focus {
+                        Focus::Step {
+                            channel: c,
+                            note: n,
+                            step: j,
+                        } if (c, n, j) == (channel, note, i) => true,
+                        _ => false,
+                    };
+                    if highlight {
                         print!(
                             "{}{}",
                             termion::color::Bg(termion::color::Blue),
                             termion::color::Fg(termion::color::Black),
                         );
                     }
+                    for _ in 0..spaces {
+                        print!(" ");
+                    }
+                    let ch = if step.is_some() { "." } else { " " };
+                    print!("{}", ch,);
+                    if highlight {
+                        print!(
+                            "{}{}",
+                            termion::color::Bg(termion::color::Reset),
+                            termion::color::Fg(termion::color::Reset),
+                        );
+                    }
                 }
-                for _ in 0..spaces {
-                    print!(" ");
-                }
-                let ch = if step.is_some() { "." } else { " " };
-                print!(
-                    "{}{}{}",
-                    ch,
-                    termion::color::Bg(termion::color::Reset),
-                    termion::color::Fg(termion::color::Reset),
-                );
+                print!("|\r\n");
             }
-            print!("|\r\n");
         }
 
         // Print step information to the right.
         let x = 12 + MAX_STEPS as u16;
         let y = 2;
-        if let Some(step) = self
+        match self.focus {
+            Focus::Step {
+                channel,
+                note,
+                step,
+            } => {
+                if let Some(step) = self
+                    .tracks
+                    .0
+                    .get(&channel)
+                    .and_then(|notes| notes.get(&note))
+                    .and_then(|steps| steps.get(step).copied())
+                    .flatten()
+                {
+                    print!(
+                        "{}v={}{}l={}{}d={}",
+                        termion::cursor::Goto(x, y),
+                        step.velocity,
+                        termion::cursor::Goto(x, y + 1),
+                        step.length,
+                        termion::cursor::Goto(x, y + 2),
+                        step.delay,
+                    );
+                } else {
+                    print!(
+                        "{}{}{}{}{}{}",
+                        termion::cursor::Goto(x, y),
+                        termion::clear::UntilNewline,
+                        termion::cursor::Goto(x, y + 1),
+                        termion::clear::UntilNewline,
+                        termion::cursor::Goto(x, y + 2),
+                        termion::clear::UntilNewline,
+                    );
+                }
+            }
+            _ => (),
+        };
+    }
+    fn print_clock(&self) {
+        let row = 2 + self
             .tracks
             .0
             .values()
-            .nth(self.focus_row)
-            .and_then(|steps| steps.get(self.focus_step).copied())
-            .flatten()
-        {
-            print!(
-                "{}v={}{}l={}{}d={}",
-                termion::cursor::Goto(x, y),
-                step.velocity,
-                termion::cursor::Goto(x, y + 1),
-                step.length,
-                termion::cursor::Goto(x, y + 2),
-                step.delay,
-            );
-        } else {
-            print!(
-                "{}{}{}{}{}{}",
-                termion::cursor::Goto(x, y),
-                termion::clear::UntilNewline,
-                termion::cursor::Goto(x, y + 1),
-                termion::clear::UntilNewline,
-                termion::cursor::Goto(x, y + 2),
-                termion::clear::UntilNewline,
-            );
-        }
-    }
-    fn print_clock(&self) {
-        let row = 2 + self.tracks.0.len() as u16;
+            .map(|notes| notes.len())
+            .sum::<usize>() as u16;
         print!(
             "{}{}^\r\n",
             termion::cursor::Goto(10 + self.clock, row),
@@ -652,11 +932,6 @@ fn main() {
             .unwrap();
     }
 
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        println!("{}", termion::screen::ToMainScreen);
-        default_hook(info);
-    }));
     let stdin = stdin();
     let _stdout = {
         let stdout = stdout().into_raw_mode().unwrap();
@@ -677,8 +952,12 @@ fn main() {
     let mut ui = Ui {
         record: RECORD.load(Ordering::Relaxed),
         clock: 0,
-        focus_row: 0,
-        focus_step: 0,
+
+        focus: Focus::Step {
+            channel: 0,
+            note: 0,
+            step: 0,
+        },
 
         tracks: Tracks::default(),
         undo: Vec::new(),
@@ -697,11 +976,10 @@ fn main() {
                 match event {
                     seq::Event::Note {channel, note, velocity, length} => {
                         ui.undo.push(ui.tracks.clone());
-                        let mut steps = ui.tracks.0.get(&(channel, note)).copied().unwrap_or((0..16).map(|_| None).collect());
+                        let steps = &mut ui.tracks.0.entry(channel).or_default().entry(note).or_insert((0..16).map(|_| None).collect());
                         let step = (time * steps.len() as f64) as usize;
                         let delay = time % (1.0 / steps.len() as f64);
                         steps[step] = Some(Step{velocity, length, delay});
-                        ui.tracks.0.insert((channel, note), steps);
                         ui.seq_tx.send(ui.tracks.build_seq()).unwrap();
                     },
                     _ => continue 'running,
